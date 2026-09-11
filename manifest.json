@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "AI Meeting Copilot",
+  "version": "0.1.2",
+  "description": "Real-time dual-channel transcription for Google Meet.",
+  "permissions": ["activeTab", "tabCapture", "offscreen", "storage", "tabs"],
+  "host_permissions": [
+    "https://meet.google.com/*",
+    "https://api.deepgram.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "AI Meeting Copilot"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://meet.google.com/*"],
+      "js": ["config.js", "romanize.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["offscreen.html"],
+      "matches": ["https://meet.google.com/*"]
+    }
+  ]
+}
