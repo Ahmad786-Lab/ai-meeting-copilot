@@ -1,14 +1,9 @@
 /**
- * agents.js — the multi-agent fan-out.
+ * agents.js — the multi-agent fan-out & Director.
  *
  * On every completed turn, four agents run IN PARALLEL against the
- * meeting's own isolated store. A fifth component, the Director,
- * reads all four results and decides whether the user's attention is
- * worth interrupting.
- *
- * Layer 1 is pure pattern matching and costs nothing. Layer 2 only
- * fires when Layer 1 finds a candidate, which keeps latency and spend
- * down and stops the HUD nagging on every sentence.
+ * meeting's own isolated store. The Director reads all four results
+ * and provides contextual sales talking points and objection battle cards.
  */
 
 import { AGENDA_SLOTS, missingSlots } from "./state.js";
@@ -16,62 +11,62 @@ import { llmJson, llmAvailable } from "./llm.js";
 import { retrieveKnowledge } from "./knowledge.js";
 
 // ---------------------------------------------------------------
-// Layer 1 — free, instant pattern matching
+// Layer 1 — Pattern Matching for Live Meeting Events
 // ---------------------------------------------------------------
 
 const PATTERNS = [
   {
     event: "price_objection",
-    label: "PRICE OBJECTION",
-    re: /\b(expensive|too much|pricey|costs? too|out of (our )?budget|cheaper|quoted us|lower price|can'?t afford)\b/i,
+    label: "PRICE OBJECTION BATTLE CARD",
+    re: /\b(expensive|too much|pricey|costs? too|out of (our )?budget|cheaper|quoted us|lower price|can'?t afford|high price|five thousand|eight thousand)\b/i,
     importance: 0.95
   },
   {
     event: "competitor_mention",
-    label: "COMPETITOR",
-    re: /\b(another agency|another vendor|competitor|we'?re also (talking|looking)|other quote|someone else quoted)\b/i,
+    label: "COMPETITOR COMPARISON",
+    re: /\b(another agency|another vendor|competitor|we'?re also (talking|looking)|other quote|someone else quoted|alternative|other firm)\b/i,
     importance: 0.85
   },
   {
     event: "pain_point",
-    label: "QUANTIFY THE PAIN",
-    re: /\b(manually|hours (a|every|per) week|struggle|problem is|pain|frustrat|takes us|waste|inefficien|bottleneck)\b/i,
+    label: "TALKING POINT: QUANTIFY THE PAIN",
+    re: /\b(manually|manual|hours (a|every|per) week|struggle|problem is|pain|frustrat|takes us|waste|inefficien|bottleneck|time consuming|headache)\b/i,
     importance: 0.8
   },
   {
     event: "buying_signal",
-    label: "BUYING SIGNAL",
-    re: /\b(how (soon|quickly) can|when could we start|what'?s the next step|send (us|me) (a|the) proposal|sign|get started|onboard)\b/i,
+    label: "BUYING SIGNAL: CLOSE FOR NEXT STEPS",
+    re: /\b(how (soon|quickly) can|when could we start|what'?s the next step|send (us|me) (a|the) proposal|sign|get started|onboard|move forward|sounds great|interested)\b/i,
     importance: 0.9
   },
   {
     event: "budget",
-    label: "BUDGET MENTIONED",
-    re: /\b(budget|\$\s?\d|\d+k\b|spend|allocated|price range)\b/i,
-    importance: 0.7
-  },
-  {
-    event: "timeline",
-    label: "TIMELINE",
-    re: /\b(by (next|the end)|deadline|timeline|q[1-4]\b|next (month|quarter|week)|asap|end of (the )?(month|year))\b/i,
-    importance: 0.6
-  },
-  {
-    event: "decision_maker",
-    label: "DECISION MAKER",
-    re: /\b(my (boss|partner|team)|need to (check|ask|run it by)|the board|our cto|ceo|approve|sign ?off|stakeholder)\b/i,
+    label: "TALKING POINT: VALUE ANCHORING",
+    re: /\b(budget|\$\s?\d|\d+k\b|spend|allocated|price range|investment|cost limit)\b/i,
     importance: 0.75
   },
   {
+    event: "timeline",
+    label: "TALKING POINT: TIMELINE QUALIFICATION",
+    re: /\b(by (next|the end)|deadline|timeline|q[1-4]\b|next (month|quarter|week)|asap|end of (the )?(month|year)|launch date)\b/i,
+    importance: 0.7
+  },
+  {
+    event: "decision_maker",
+    label: "TALKING POINT: STAKEHOLDER MAPPING",
+    re: /\b(my (boss|partner|team)|need to (check|ask|run it by)|the board|our cto|ceo|approve|sign ?off|stakeholder|manager)\b/i,
+    importance: 0.8
+  },
+  {
     event: "technical_question",
-    label: "QUESTION ASKED",
-    re: /\b(have you (worked|done)|do you (have|support|integrate)|can you|what about|experience with|case stud)\b/i,
+    label: "TECHNICAL & CAPABILITIES PROMPT",
+    re: /\b(have you (worked|done)|do you (have|support|integrate)|can you|what about|experience with|case stud|how does your|tech stack|architecture)\b/i,
     importance: 0.8
   },
   {
     event: "scope_risk",
-    label: "SCOPE RISK",
-    re: /\b(also need|while you'?re at it|one more thing|could you also|add(ing)? on|as well as)\b/i,
+    label: "SCOPE MANAGEMENT PROMPT",
+    re: /\b(also need|while you'?re at it|one more thing|could you also|add(ing)? on|as well as|feature creep)\b/i,
     importance: 0.7
   }
 ];
@@ -81,7 +76,7 @@ function detectPatterns(text) {
 }
 
 const COMMITMENT_RE =
-  /\b(i'?ll|we'?ll|i will|we will|let me|send (you|me)|i'?m going to|by (monday|tuesday|wednesday|thursday|friday|tomorrow|next week)|follow up)\b/i;
+  /\b(i'?ll|we'?ll|i will|we will|let me|send (you|me)|i'?m going to|by (monday|tuesday|wednesday|thursday|friday|tomorrow|next week)|follow up|proposal by)\b/i;
 
 // ---------------------------------------------------------------
 // Agent 1 — Event Detector
@@ -91,11 +86,8 @@ async function eventAgent(meeting, speaker, text) {
   const hits = detectPatterns(text);
   if (!hits.length) return { events: [] };
 
-  // In demo & testing, trigger events on all turns so solo test / roleplay works
-  const relevant = hits;
-
   return {
-    events: relevant.map((h) => ({
+    events: hits.map((h) => ({
       event: h.event,
       label: h.label,
       importance: h.importance
@@ -104,59 +96,36 @@ async function eventAgent(meeting, speaker, text) {
 }
 
 // ---------------------------------------------------------------
-// Agent 2 — Agenda Tracker (slot filling)
+// Agent 2 — Agenda Tracker (Slot Filling)
 // ---------------------------------------------------------------
 
 async function agendaAgent(meeting, speaker, text) {
   const open = missingSlots(meeting);
   if (!open.length) return { diff: null };
 
-  // Cheap pre-filter: don't call the model unless a slot plausibly moved.
   const looksRelevant = PATTERNS.some(
     (p) => AGENDA_SLOTS.includes(p.event) && p.re.test(text)
-  ) || /\b(problem|goal|want|need|hoping|trying to)\b/i.test(text);
+  ) || /\b(problem|goal|want|need|hoping|trying to|budget|timeline|deadline|hours|manual)\b/i.test(text);
 
   if (!looksRelevant) return { diff: null };
 
-  // No model key? Fall back to patterns so the agenda still fills.
-  if (!llmAvailable) return { diff: rulesDiff(text, open) };
-
-  const diff = await llmJson({
-    system:
-      "You extract structured facts from one turn of a sales discovery call. " +
-      "Return JSON only. Include a key ONLY if this turn clearly establishes it. " +
-      "Omit anything uncertain. Values must be under 8 words.",
-    user:
-      `Open slots: ${open.join(", ")}\n` +
-      `Speaker: ${speaker}\n` +
-      `Turn: "${text}"\n\n` +
-      `Return JSON with any of: ${open.map((s) => `"${s}"`).join(", ")}. ` +
-      `Return {} if nothing is established.`,
-    fallback: {}
-  });
-
-  return { diff };
-}
-
-const SLOT_RULES = {
-  problem: /\b(manually|problem is|struggle|pain|takes us|waste|bottleneck|hours (a|every|per) week)\b/i,
-  goals: /\b(we want|we need|goal is|hoping to|trying to|looking to|success (would|looks))\b/i,
-  budget: /\b(budget|\$\s?\d|\d+\s?k\b|thousand|allocated|price range|we can spend)\b/i,
-  timeline: /\b(by (next|the end)|deadline|q[1-4]\b|next (month|quarter|week)|end of (the )?(month|quarter|year)|asap)\b/i,
-  decision_maker: /\b(my (boss|partner|manager)|check with|run it by|the board|approve|sign ?off|i decide|i'?m the one who)\b/i,
-  next_step: /\b(send (you|me)|follow up|next step|proposal|schedule|book|call on|meet (again|on))\b/i
-};
-
-function rulesDiff(text, open) {
   const diff = {};
-  for (const slot of open) {
-    const re = SLOT_RULES[slot];
-    if (re && re.test(text)) {
-      // Store the sentence fragment as evidence.
-      diff[slot] = text.length > 60 ? text.slice(0, 57) + "..." : text;
-    }
+  const lower = text.toLowerCase();
+
+  if (open.includes("problem") && (lower.includes("problem") || lower.includes("struggle") || lower.includes("manual") || lower.includes("waste"))) {
+    diff.problem = text.slice(0, 100);
   }
-  return Object.keys(diff).length ? diff : null;
+  if (open.includes("budget") && (lower.includes("thousand") || lower.includes("$") || lower.includes("budget") || lower.includes("quote"))) {
+    diff.budget = text.slice(0, 80);
+  }
+  if (open.includes("timeline") && (lower.includes("quarter") || lower.includes("month") || lower.includes("week") || lower.includes("soon") || lower.includes("asap"))) {
+    diff.timeline = text.slice(0, 80);
+  }
+  if (open.includes("decision_maker") && (lower.includes("boss") || lower.includes("board") || lower.includes("team") || lower.includes("approve") || lower.includes("cto"))) {
+    diff.decision_maker = text.slice(0, 80);
+  }
+
+  return { diff: Object.keys(diff).length ? diff : null };
 }
 
 // ---------------------------------------------------------------
@@ -166,32 +135,18 @@ function rulesDiff(text, open) {
 async function commitmentAgent(meeting, speaker, text) {
   if (!COMMITMENT_RE.test(text)) return { commitments: [] };
 
-  if (!llmAvailable) {
-    const due = text.match(
-      /\b(monday|tuesday|wednesday|thursday|friday|tomorrow|next week|end of (the )?(week|month))\b/i
-    );
-    return {
-      commitments: [
-        {
-          owner: speaker,
-          action: text.length > 70 ? text.slice(0, 67) + "..." : text,
-          due: due ? due[0] : null
-        }
-      ]
-    };
-  }
+  const match = text.match(/by\s+(monday|tuesday|wednesday|thursday|friday|tomorrow|next week)/i);
+  const due = match ? match[1] : null;
 
-  const result = await llmJson({
-    system:
-      "Extract concrete commitments from one turn of a meeting. " +
-      "A commitment is a specific action someone promised to do. " +
-      "Return JSON: {\"commitments\":[{\"owner\":\"YOU\"|\"CLIENT\",\"action\":\"...\",\"due\":\"...\"|null}]}. " +
-      "Return an empty array if nothing was actually promised.",
-    user: `Speaker: ${speaker}\nTurn: "${text}"`,
-    fallback: { commitments: [] }
-  });
-
-  return { commitments: result.commitments || [] };
+  return {
+    commitments: [
+      {
+        owner: speaker,
+        action: text.slice(0, 90),
+        due
+      }
+    ]
+  };
 }
 
 // ---------------------------------------------------------------
@@ -199,28 +154,24 @@ async function commitmentAgent(meeting, speaker, text) {
 // ---------------------------------------------------------------
 
 async function knowledgeAgent(meeting, speaker, text) {
-  // Search knowledge on all turns so solo demo testing triggers battle cards
   const knowledge = await retrieveKnowledge(text);
   return { knowledge };
 }
 
 // ---------------------------------------------------------------
-// The Director — decides whether to interrupt
+// The Director — Surfaces Talking Points & Battle Cards
 // ---------------------------------------------------------------
 
-const COOLDOWN_MS = 3000; // hackathon demo pacing (3s)
-const MAX_CUES = 12;
+const COOLDOWN_MS = 2500; // 2.5s pacing
+const MAX_CUES = 25;
 
 async function director(meeting, speaker, text, results) {
   const { events, knowledge } = results;
-
-  if (!events.length && !knowledge) return null;
-
   const now = Date.now();
+
   if (meeting.cue_count >= MAX_CUES) return null;
 
-  // Knowledge beats advice and bypasses the cooldown: the client asked a
-  // direct question, so answering it is never an interruption.
+  // 1. Knowledge match (case study, pricing, team structure) always takes priority
   if (knowledge) {
     meeting.last_cue_at = now;
     meeting.cue_count += 1;
@@ -228,67 +179,132 @@ async function director(meeting, speaker, text, results) {
       label: knowledge.label,
       bullets: knowledge.bullets,
       source: "knowledge",
-      event: "knowledge_retrieval"
+      event: "knowledge_retrieval",
+      urgent: true
     };
   }
 
-  const top = events.sort((a, b) => b.importance - a.importance)[0];
+  // 2. High-priority conversation events (objections, buying signals, pain points)
+  if (events && events.length > 0) {
+    const top = events.sort((a, b) => b.importance - a.importance)[0];
+    const urgent = top.importance >= 0.85;
 
-  // High-stakes moments (price objections, buying signals) override the
-  // cooldown. Everything else waits its turn.
-  const urgent = top.importance >= 0.9;
-  if (!urgent && now - meeting.last_cue_at < COOLDOWN_MS) return null;
+    if (!urgent && now - meeting.last_cue_at < COOLDOWN_MS) {
+      return null;
+    }
 
-  const cue = await llmJson({
-    system:
-      "You are a live sales copilot. The user is mid-conversation and can " +
-      "only glance at the screen. Return JSON: {\"bullets\":[\"...\",\"...\"]}. " +
-      "Maximum 2 bullets. Each bullet MUST be under 7 words. " +
-      "Imperative voice. No pleasantries, no explanation, no punctuation at the end.",
-    user:
-      `Detected: ${top.event}\n` +
-      `Client just said: "${text}"\n` +
-      `Still missing from agenda: ${missingSlots(meeting).join(", ") || "nothing"}\n` +
-      `What should the user do right now?`,
-    fallback: { bullets: fallbackBullets(top.event) }
-  });
+    const bullets = fallbackBullets(top.event);
 
-  meeting.last_cue_at = now;
-  meeting.cue_count += 1;
+    meeting.last_cue_at = now;
+    meeting.cue_count += 1;
 
-  return {
-    label: top.label,
-    bullets: (cue.bullets || []).slice(0, 2),
-    source: "llm",
-    event: top.event
-  };
+    return {
+      label: top.label,
+      bullets: bullets.slice(0, 2),
+      source: "event_detector",
+      event: top.event,
+      urgent
+    };
+  }
+
+  // 3. Proactive Talking Points for YOU (driving the agenda forward)
+  if (speaker === "YOU" && now - meeting.last_cue_at >= COOLDOWN_MS) {
+    const missing = missingSlots(meeting);
+    if (missing.length > 0) {
+      const nextSlot = missing[0];
+      const slotTalkingPoints = {
+        problem: {
+          label: "TALKING POINT: UNCOVER WORKFLOW PAIN",
+          bullets: ["Ask what part of the workflow is slowest", "Ask how many hours per week are lost"]
+        },
+        impact: {
+          label: "TALKING POINT: QUANTIFY BUSINESS IMPACT",
+          bullets: ["Ask what happens if this isn't solved", "Anchor cost against ongoing manual hours"]
+        },
+        timeline: {
+          label: "TALKING POINT: QUALIFY DEADLINE",
+          bullets: ["Ask what date or event drives this", "Confirm target kickoff date"]
+        },
+        budget: {
+          label: "TALKING POINT: ALIGN ON BUDGET",
+          bullets: ["Ask what range was approved for this", "Anchor value before discussing numbers"]
+        },
+        decision_maker: {
+          label: "TALKING POINT: MAP KEY STAKEHOLDERS",
+          bullets: ["Ask who else evaluates proposals", "Offer to present directly to their team"]
+        },
+        next_step: {
+          label: "TALKING POINT: SECURE NEXT MEETING",
+          bullets: ["Propose a 30-min review this Thursday", "Confirm specific scope for proposal"]
+        }
+      };
+
+      if (slotTalkingPoints[nextSlot]) {
+        meeting.last_cue_at = now;
+        meeting.cue_count += 1;
+        return {
+          ...slotTalkingPoints[nextSlot],
+          source: "agenda_copilot",
+          event: "proactive_talking_point",
+          urgent: false
+        };
+      }
+    }
+  }
+
+  return null;
 }
 
-// Cached bullets so the HUD never blocks on the network.
+// Battle card talk tracks
 function fallbackBullets(event) {
   const map = {
-    price_objection: ["Ask what their quote includes", "Re-anchor on business outcome"],
-    competitor_mention: ["Ask what they liked", "Differentiate on outcome"],
-    pain_point: ["Ask what those hours cost", "Find out who handles it"],
-    buying_signal: ["Confirm a specific date", "Ask who else must approve"],
-    budget: ["Ask what range they approved", "Tie price to the cost of inaction"],
-    timeline: ["Ask what drives that date", "Confirm the decision process"],
-    decision_maker: ["Ask who signs off", "Offer to join that conversation"],
-    technical_question: ["Answer with a specific example", "Ask why it matters to them"],
-    scope_risk: ["Clarify what is in scope", "Price the addition separately"]
+    price_objection: [
+      "Acknowledge: 'Understand completely, let's look at scope.'",
+      "Ask: 'What specific capabilities were included in that quote?'"
+    ],
+    competitor_mention: [
+      "Ask what capabilities stood out to them most",
+      "Differentiate on senior engineering pod & speed to production"
+    ],
+    pain_point: [
+      "Ask how many team hours are lost every week",
+      "Calculate monthly cost of that manual bottleneck"
+    ],
+    buying_signal: [
+      "Confirm a specific date: 'Let's review Thursday at 2 PM.'",
+      "Ask who else on the team should join the review"
+    ],
+    budget: [
+      "Ask what price range they have allocated for this",
+      "Anchor against the cost of doing nothing for another quarter"
+    ],
+    timeline: [
+      "Ask what business milestone is driving that deadline",
+      "Highlight: We kickoff within 10 business days"
+    ],
+    decision_maker: [
+      "Ask who gives final commercial approval",
+      "Offer to send an executive summary deck for their boss"
+    ],
+    technical_question: [
+      "Cite relevant production milestone (e.g. MedFlow in 4 wks)",
+      "Offer to share technical architecture breakdown"
+    ],
+    scope_risk: [
+      "Clarify what is included in core Phase 1 sprint",
+      "Offer to price add-on features in secondary milestone"
+    ]
   };
-  return map[event] || ["Ask an open follow-up question"];
+  return map[event] || ["Ask an open follow-up question to probe deeper"];
 }
 
 // ---------------------------------------------------------------
-// Fan-out
+// Fan-Out Entrypoint
 // ---------------------------------------------------------------
 
 export async function processTurn(meeting, speaker, text, turnIndex) {
   const t0 = Date.now();
 
-  // Four agents, genuinely in parallel, each reading the same
-  // meeting-scoped store.
   const [ev, ag, cm, kn] = await Promise.all([
     eventAgent(meeting, speaker, text),
     agendaAgent(meeting, speaker, text),
