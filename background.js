@@ -103,7 +103,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         .then(() => sendResponse({ ok: true }))
         .catch((err) => {
           console.error("[copilot] activation failed:", err);
-          // Only surface the error in the HUD if nothing is actually running.
           if (!capturing) {
             toContent({ type: "MEETING_AUDIO_ERROR", error: err.message });
           }
@@ -120,15 +119,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         .catch((err) => sendResponse({ ok: false, error: err.message }));
       return true;
 
-    // Content script asking us to start meeting audio alongside the mic.
+    // Content script asking to start meeting audio directly or via popup bridge
     case "START_MEETING_AUDIO":
-      startTabCapture(sender.tab.id)
+    case "REQUEST_MEETING_AUDIO": {
+      const tabId = (sender && sender.tab) ? sender.tab.id : (message.tabId || activeTabId);
+      startTabCapture(tabId)
         .then(() => sendResponse({ ok: true }))
-        .catch((err) => {
-          console.error("[copilot] meeting audio failed:", err);
-          sendResponse({ ok: capturing, error: err.message });
+        .catch(async (err) => {
+          console.warn("[copilot] meeting audio direct start failed, trying popup bridge:", err.message);
+          try {
+            await chrome.storage.local.set({ autoStartTabAudio: true, targetTabId: tabId });
+            if (chrome.action && chrome.action.openPopup) {
+              await chrome.action.openPopup();
+              sendResponse({ ok: true, viaPopup: true });
+            } else {
+              sendResponse({
+                ok: false,
+                error: "Click extension icon in toolbar once to enable tab audio."
+              });
+            }
+          } catch (popupErr) {
+            console.error("[copilot] openPopup failed:", popupErr.message);
+            sendResponse({
+              ok: false,
+              error: "Click extension icon in toolbar once to permit tab audio."
+            });
+          }
         });
       return true;
+    }
 
     case "STOP_MEETING_AUDIO":
       stopTabCapture()

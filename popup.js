@@ -1,4 +1,4 @@
-/* popup.js */
+/* popup.js — Toolbar popup & auto-bridge */
 
 const activateBtn = document.getElementById("activate");
 const deactivateBtn = document.getElementById("deactivate");
@@ -30,6 +30,24 @@ async function init() {
     activateBtn.classList.add("hidden");
     deactivateBtn.classList.remove("hidden");
     say("Meeting audio connected.", "ok");
+  }
+
+  // Auto-connect bridge if requested directly from HUD
+  try {
+    const data = await chrome.storage.local.get(["autoStartTabAudio", "targetTabId"]);
+    if (data && data.autoStartTabAudio && isMeet) {
+      await chrome.storage.local.remove(["autoStartTabAudio", "targetTabId"]);
+      const tabId = data.targetTabId || (currentTab && currentTab.id);
+      if (tabId) {
+        say("Connecting meeting audio…", "");
+        activateBtn.click();
+        setTimeout(() => {
+          window.close();
+        }, 600);
+      }
+    }
+  } catch (e) {
+    console.warn("[popup auto-bridge]", e);
   }
 }
 

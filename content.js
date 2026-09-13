@@ -3,10 +3,10 @@
  *
  * Features:
  *  - Fully draggable anywhere on screen by the header bar
- *  - Consolidated 1-click "Activate Copilot" button in the HUD (no popup needed)
+ *  - Two dedicated control buttons: [ 🎙️ My Audio ] and [ 🔊 Meeting Audio ]
  *  - Dropdown menu style with collapsible sections for minimal footprint
  *  - Dual-channel real-time transcription (YOU mic + CLIENT tab audio)
- *  - Google Meet Mute sync (pauses mic and toggles YOU (MUTED) pill)
+ *  - Google Meet Mute sync (pauses mic and toggles [ 🎙️ My Audio: MUTED ])
  *  - Live sales battle cards & proactive talking points
  *  - Post-meeting intelligence scorecard & 1-click follow-up email
  */
@@ -20,19 +20,17 @@
     SERVER_URL: "http://localhost:3000",
     DEEPGRAM_API_KEY: "",
     LANGUAGE: "multi",
-    MODEL: "nova-3",
+    MODEL: "nova-2",
     RESPECT_MEET_MUTE: true,
     ROMANIZE: true
   };
 
   let meetingId = "meet-" + Date.now();
-  let listening = false;
-  let isStarting = false;
-  let manualStop = false;
+  let isMyAudioLive = false;
+  let isMeetingAudioLive = false;
 
   let micStream = null;
   let socket = null;
-  let recorder = null;
   let keepAliveTimer = null;
   let currentCueTimer = null;
 
@@ -163,78 +161,98 @@
       }
       .cp-menu-item:hover { background: rgba(255, 255, 255, 0.08); color: #fff; }
 
-      /* Sub-Bar: Audio Status & Controls */
-      .cp-subbar {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 8px 14px;
-        background: rgba(0, 0, 0, 0.2);
-        border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-      }
-      .cp-pills { display: flex; gap: 6px; }
-      .cp-pill {
-        display: inline-flex;
-        align-items: center;
-        padding: 3px 8px;
-        border-radius: 12px;
-        font-size: 10px;
-        font-weight: 600;
-        letter-spacing: 0.3px;
-        background: rgba(255, 255, 255, 0.06);
-        color: #9aa0a6;
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        transition: all 0.2s ease;
-      }
-      .cp-pill.on {
-        background: rgba(52, 168, 83, 0.2);
-        color: #81c995;
-        border-color: rgba(52, 168, 83, 0.4);
-      }
-      .cp-pill.client-on {
-        background: rgba(66, 133, 244, 0.2);
-        color: #8ab4f8;
-        border-color: rgba(66, 133, 244, 0.4);
-      }
-      .cp-pill.muted {
-        background: rgba(234, 67, 53, 0.2) !important;
-        color: #f28b82 !important;
-        border-color: rgba(234, 67, 53, 0.4) !important;
-      }
-
-      /* Unified Action Button: "Activate Copilot" */
-      .cp-action-bar {
-        padding: 10px 14px;
+      /* Dual Audio Action Bar */
+      .cp-audio-bar {
+        padding: 8px 12px;
         display: flex;
         gap: 8px;
+        background: rgba(0, 0, 0, 0.25);
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
       }
-      .cp-main-btn {
+      .cp-audio-btn {
         flex: 1;
-        padding: 9px 14px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.12);
         border-radius: 8px;
-        font-weight: 600;
-        font-size: 13px;
-        border: none;
+        padding: 8px 10px;
+        color: #e8eaed;
         cursor: pointer;
         display: flex;
         align-items: center;
-        justify-content: center;
-        gap: 8px;
+        justify-content: space-between;
+        gap: 6px;
+        font-family: inherit;
+        font-size: 11px;
+        font-weight: 600;
+        transition: all 0.2s ease;
+        outline: none;
+      }
+      .cp-audio-btn:hover {
+        background: rgba(255, 255, 255, 0.1);
+        border-color: rgba(255, 255, 255, 0.22);
+      }
+      .cp-btn-left {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .cp-btn-icon {
+        font-size: 13px;
+      }
+      .cp-btn-name {
+        font-size: 11px;
+        font-weight: 600;
+        color: #f1f3f4;
+        white-space: nowrap;
+      }
+      .cp-btn-badge {
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+        padding: 2px 6px;
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.08);
+        color: #9aa0a6;
+        transition: all 0.2s ease;
+      }
+
+      /* My Audio States */
+      .cp-audio-btn.my-live {
+        background: rgba(52, 168, 83, 0.16);
+        border-color: rgba(52, 168, 83, 0.45);
+      }
+      .cp-audio-btn.my-live .cp-btn-badge {
+        background: #34a853;
+        color: #ffffff;
+        box-shadow: 0 0 6px rgba(52, 168, 83, 0.6);
+      }
+      .cp-audio-btn.my-muted {
+        background: rgba(234, 67, 53, 0.18);
+        border-color: rgba(234, 67, 53, 0.5);
+      }
+      .cp-audio-btn.my-muted .cp-btn-badge {
+        background: #ea4335;
+        color: #ffffff;
+      }
+
+      /* Meeting Audio States */
+      .cp-audio-btn.client-live {
+        background: rgba(26, 115, 232, 0.2);
+        border-color: rgba(66, 133, 244, 0.5);
+      }
+      .cp-audio-btn.client-live .cp-btn-badge {
         background: #1a73e8;
         color: #ffffff;
-        box-shadow: 0 2px 6px rgba(26, 115, 232, 0.35);
-        transition: all 0.15s ease;
+        box-shadow: 0 0 6px rgba(66, 133, 244, 0.6);
       }
-      .cp-main-btn:hover { background: #1557b0; }
-      .cp-main-btn.active {
-        background: #ea4335;
-        box-shadow: 0 2px 6px rgba(234, 67, 53, 0.35);
+      .cp-audio-btn.connecting .cp-btn-badge {
+        background: #fbbc04;
+        color: #202124;
       }
-      .cp-main-btn.active:hover { background: #d93025; }
 
       /* Body Sections */
       .cp-body {
-        padding: 0 14px 12px 14px;
+        padding: 0 12px 12px 12px;
         display: flex;
         flex-direction: column;
         gap: 10px;
@@ -250,6 +268,7 @@
         padding: 10px 12px;
         display: none;
         animation: cpSlideDown 0.2s ease-out;
+        margin-top: 8px;
       }
       @keyframes cpSlideDown {
         from { opacity: 0; transform: translateY(-6px); }
@@ -393,10 +412,11 @@
       .cp-err {
         color: #f28b82;
         font-size: 11px;
-        padding: 6px 12px;
+        padding: 6px 10px;
         background: rgba(234, 67, 53, 0.15);
         border-radius: 6px;
         display: none;
+        margin-top: 8px;
       }
     </style>
 
@@ -420,19 +440,22 @@
       <div class="cp-menu-item" id="cp-menu-reset">🔄 Reset Current Meeting</div>
     </div>
 
-    <!-- Sub-Bar: Dual Audio Indicators -->
-    <div class="cp-subbar">
-      <div class="cp-pills">
-        <span class="cp-pill" id="cp-pill-you">YOU (MIC)</span>
-        <span class="cp-pill" id="cp-pill-client">CLIENT (AUDIO)</span>
-      </div>
-      <span id="cp-hint" style="font-size:10px; color:#9aa0a6;">1-click to start</span>
-    </div>
+    <!-- Dual Audio Action Buttons (My Audio & Meeting Audio) -->
+    <div class="cp-audio-bar" id="cp-audio-bar">
+      <button class="cp-audio-btn" id="cp-btn-my-audio" title="Start/Stop your microphone">
+        <div class="cp-btn-left">
+          <span class="cp-btn-icon">🎙️</span>
+          <span class="cp-btn-name">My Audio</span>
+        </div>
+        <span class="cp-btn-badge" id="cp-badge-my-audio">START</span>
+      </button>
 
-    <!-- Unified "Activate Copilot" Action Button -->
-    <div class="cp-action-bar">
-      <button class="cp-main-btn" id="cp-activate-btn">
-        <span>⚡ Activate Copilot</span>
+      <button class="cp-audio-btn" id="cp-btn-meeting-audio" title="Start/Stop meeting audio capture">
+        <div class="cp-btn-left">
+          <span class="cp-btn-icon">🔊</span>
+          <span class="cp-btn-name">Meeting Audio</span>
+        </div>
+        <span class="cp-btn-badge" id="cp-badge-meeting-audio">START</span>
       </button>
     </div>
 
@@ -450,7 +473,7 @@
       </div>
 
       <!-- Accordion 1: Live Speech Transcript Dropdown -->
-      <div class="cp-accordion">
+      <div class="cp-accordion" style="margin-top: 4px;">
         <div class="cp-acc-header" id="cp-acc-head-transcript">
           <span>📝 LIVE SPEECH TRANSCRIPT</span>
           <span id="cp-acc-arrow-transcript">▾</span>
@@ -493,16 +516,18 @@
   `;
   document.body.appendChild(root);
 
-  // ---------------- DOM Helpers ----------------
+  // ---------------- DOM References ----------------
   const $ = (id) => document.getElementById(id);
   const hud = $("ai-copilot-hud");
   const dragHandle = $("cp-drag-handle");
-  const activateBtn = $("cp-activate-btn");
   const dotEl = $("cp-dot");
   const stateEl = $("cp-state");
-  const hintEl = $("cp-hint");
-  const pillYou = $("cp-pill-you");
-  const pillClient = $("cp-pill-client");
+
+  const btnMyAudio = $("cp-btn-my-audio");
+  const badgeMyAudio = $("cp-badge-my-audio");
+  const btnMeetingAudio = $("cp-btn-meeting-audio");
+  const badgeMeetingAudio = $("cp-badge-meeting-audio");
+
   const cueEl = $("cp-cue");
   const cueBadgeTxt = $("cp-cue-badge-txt");
   const cueBullets = $("cp-cue-bullets");
@@ -533,7 +558,6 @@
     let newX = e.clientX - dragOffset.x;
     let newY = e.clientY - dragOffset.y;
 
-    // Bounds checking
     const maxX = window.innerWidth - hud.offsetWidth - 8;
     const maxY = window.innerHeight - hud.offsetHeight - 8;
     newX = Math.max(8, Math.min(newX, maxX));
@@ -557,7 +581,7 @@
     isMinimized = !isMinimized;
     hud.classList.toggle("minimized", isMinimized);
     $("cp-body").style.display = isMinimized ? "none" : "flex";
-    $("cp-activate-btn").parentElement.style.display = isMinimized ? "none" : "flex";
+    $("cp-audio-bar").style.display = isMinimized ? "none" : "flex";
     $("cp-min-btn").textContent = isMinimized ? "+" : "—";
   });
 
@@ -626,6 +650,24 @@
     else if (state === "CONNECTING") dotEl.classList.add("connecting");
   }
 
+  function updateOverallState() {
+    if (isMyAudioLive || isMeetingAudioLive) {
+      setState("LISTENING");
+    } else {
+      setState("READY");
+    }
+  }
+
+  function checkIfAllStopped() {
+    if (!isMyAudioLive && !isMeetingAudioLive) {
+      if (turnHistory.length > 0) {
+        $("cp-acc-body-outcome").classList.add("open");
+        $("cp-acc-arrow-outcome").textContent = "▾";
+        fetchPostMeetingOutcome();
+      }
+    }
+  }
+
   function resetMeetingState() {
     meetingId = "meet-" + Date.now();
     youWordsCount = 0;
@@ -634,7 +676,7 @@
     turnHistory = [];
     cueEl.classList.remove("show");
     logEl.innerHTML = '<div class="cp-empty">Waiting for speech…</div>';
-    hintEl.textContent = "Meeting reset";
+    showError("Meeting reset.");
   }
 
   // ---------------- Google Meet Mute Detection ----------------
@@ -673,12 +715,14 @@
       const muted = checkMeetMute();
       if (muted !== isMutedByMeet) {
         isMutedByMeet = muted;
-        if (isMutedByMeet) {
-          pillYou.classList.add("muted");
-          pillYou.textContent = "YOU (MUTED)";
-        } else {
-          pillYou.classList.remove("muted");
-          pillYou.textContent = "YOU (MIC)";
+        if (isMyAudioLive) {
+          if (isMutedByMeet) {
+            btnMyAudio.classList.add("my-muted");
+            badgeMyAudio.textContent = "MUTED";
+          } else {
+            btnMyAudio.classList.remove("my-muted");
+            badgeMyAudio.textContent = "LIVE";
+          }
         }
       }
     };
@@ -692,50 +736,45 @@
       meetMuteObserver.disconnect();
       meetMuteObserver = null;
     }
-    pillYou.classList.remove("muted");
-    pillYou.textContent = "YOU (MIC)";
+    if (btnMyAudio) {
+      btnMyAudio.classList.remove("my-muted");
+      if (isMyAudioLive) badgeMyAudio.textContent = "LIVE";
+      else badgeMyAudio.textContent = "START";
+    }
     isMutedByMeet = false;
   }
 
-  // ---------------- Deepgram Audio Streaming (1-Click Unified) ----------------
+  // ---------------- [🎙️ My Audio] Controls & Deepgram Stream ----------------
 
-  async function startAllAudio() {
-    if (listening || isStarting) return;
+  async function startMyAudio() {
+    if (isMyAudioLive) return;
     try {
-      isStarting = true;
-      manualStop = false;
-      setState("CONNECTING");
-      hintEl.textContent = "Starting audio…";
-      activateBtn.innerHTML = "<span>⏳ Connecting…</span>";
-
       const apiKey = CONFIG.DEEPGRAM_API_KEY;
       if (!apiKey || apiKey === "PASTE_YOUR_DEEPGRAM_KEY_HERE") {
         throw new Error("Add Deepgram key to config.js, then reload extension.");
       }
 
+      badgeMyAudio.textContent = "WAIT...";
+      btnMyAudio.classList.add("connecting");
+      setState("CONNECTING");
+
       setupMeetMuteObserver();
 
-      // Start Deepgram WebSocket
+      // Start Deepgram WebSocket for microphone
       const url = `wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&interim_results=true&endpointing=250&encoding=linear16&sample_rate=16000`;
       socket = new WebSocket(url, ["token", apiKey]);
 
       socket.onopen = async () => {
-        isStarting = false;
-        listening = true;
-        setState("LISTENING");
-        hintEl.textContent = "Copilot Active";
-        pillYou.classList.add("on");
+        isMyAudioLive = true;
+        btnMyAudio.classList.remove("connecting");
+        btnMyAudio.classList.add("my-live");
+        badgeMyAudio.textContent = isMutedByMeet ? "MUTED" : "LIVE";
+        if (isMutedByMeet) btnMyAudio.classList.add("my-muted");
 
-        activateBtn.classList.add("active");
-        activateBtn.innerHTML = "<span>⏹ Stop Copilot</span>";
-
+        updateOverallState();
         startKeepAlive();
 
-        // 1. Initialize Microphone AudioWorklet
         await initMicStream();
-
-        // 2. Start Client Meeting Audio (Background Tab Capture)
-        startClientTabAudio();
       };
 
       socket.onmessage = (event) => {
@@ -763,18 +802,18 @@
       socket.onerror = (err) => {
         console.error("[socket error]", err);
         showError("Microphone stream connection error.");
-        stopAllAudio();
+        stopMyAudio();
       };
 
       socket.onclose = () => {
-        if (listening) stopAllAudio();
+        if (isMyAudioLive) stopMyAudio();
       };
 
     } catch (e) {
-      isStarting = false;
-      setState("READY");
+      btnMyAudio.classList.remove("connecting", "my-live");
+      badgeMyAudio.textContent = "START";
       showError(e.message);
-      activateBtn.innerHTML = "<span>⚡ Activate Copilot</span>";
+      updateOverallState();
     }
   }
 
@@ -831,12 +870,29 @@
     workletNode.connect(audioCtx.destination);
   }
 
-  function startClientTabAudio() {
-    chrome.runtime.sendMessage({ type: "START_MEETING_AUDIO" }, (res) => {
-      if (res && res.ok) {
-        pillClient.classList.add("client-on");
-      }
-    });
+  function stopMyAudio() {
+    isMyAudioLive = false;
+    btnMyAudio.classList.remove("my-live", "my-muted", "connecting");
+    badgeMyAudio.textContent = "START";
+
+    teardownMeetMuteObserver();
+    stopKeepAlive();
+
+    if (socket) {
+      try {
+        socket.send(JSON.stringify({ type: "CloseStream" }));
+        socket.close();
+      } catch (e) {}
+      socket = null;
+    }
+
+    if (micStream) {
+      micStream.getTracks().forEach((t) => t.stop());
+      micStream = null;
+    }
+
+    updateOverallState();
+    checkIfAllStopped();
   }
 
   function startKeepAlive() {
@@ -855,46 +911,49 @@
     }
   }
 
-  async function stopAllAudio() {
-    if (!listening && !socket && !micStream) return;
-    listening = false;
-    isStarting = false;
-    manualStop = true;
-    setState("READY");
-    hintEl.textContent = "Outcome generated";
+  // ---------------- [🔊 Meeting Audio] Controls & Background Bridge ----------------
 
-    activateBtn.classList.remove("active");
-    activateBtn.innerHTML = "<span>⚡ Activate Copilot</span>";
-    pillYou.classList.remove("on", "muted");
-    pillClient.classList.remove("client-on");
+  function startMeetingAudio() {
+    if (isMeetingAudioLive) return;
+    badgeMeetingAudio.textContent = "WAIT...";
+    btnMeetingAudio.classList.add("connecting");
+    setState("CONNECTING");
 
-    teardownMeetMuteObserver();
-    stopKeepAlive();
-
-    if (socket) {
-      try {
-        socket.send(JSON.stringify({ type: "CloseStream" }));
-        socket.close();
-      } catch (e) {}
-      socket = null;
-    }
-
-    if (micStream) {
-      micStream.getTracks().forEach((t) => t.stop());
-      micStream = null;
-    }
-
-    chrome.runtime.sendMessage({ type: "STOP_MEETING_AUDIO" }).catch(() => {});
-
-    // Open outcome accordion and render scores
-    $("cp-acc-body-outcome").classList.add("open");
-    $("cp-acc-arrow-outcome").textContent = "▾";
-    await fetchPostMeetingOutcome();
+    chrome.runtime.sendMessage({ type: "REQUEST_MEETING_AUDIO" }, (res) => {
+      if (chrome.runtime.lastError) {
+        btnMeetingAudio.classList.remove("connecting");
+        badgeMeetingAudio.textContent = "START";
+        showError(chrome.runtime.lastError.message);
+        updateOverallState();
+        return;
+      }
+      if (res && res.error) {
+        btnMeetingAudio.classList.remove("connecting");
+        badgeMeetingAudio.textContent = "START";
+        showError(res.error);
+        updateOverallState();
+      }
+    });
   }
 
-  activateBtn.addEventListener("click", () => {
-    if (listening) stopAllAudio();
-    else startAllAudio();
+  function stopMeetingAudio() {
+    chrome.runtime.sendMessage({ type: "STOP_MEETING_AUDIO" }).catch(() => {});
+    isMeetingAudioLive = false;
+    btnMeetingAudio.classList.remove("client-live", "connecting");
+    badgeMeetingAudio.textContent = "START";
+    updateOverallState();
+    checkIfAllStopped();
+  }
+
+  // Dual Action Button Listeners
+  btnMyAudio.addEventListener("click", () => {
+    if (isMyAudioLive) stopMyAudio();
+    else startMyAudio();
+  });
+
+  btnMeetingAudio.addEventListener("click", () => {
+    if (isMeetingAudioLive) stopMeetingAudio();
+    else startMeetingAudio();
   });
 
   // ---------------- Transcript & Talking Points Cues ----------------
@@ -1088,18 +1147,33 @@ AI Copilot Team`
     if (!message) return;
     switch (message.type) {
       case "MEETING_AUDIO_READY":
-        pillClient.classList.add("client-on");
+        isMeetingAudioLive = true;
+        btnMeetingAudio.classList.remove("connecting");
+        btnMeetingAudio.classList.add("client-live");
+        badgeMeetingAudio.textContent = "LIVE";
+        updateOverallState();
         break;
+
       case "MEETING_AUDIO_STOPPED":
-        pillClient.classList.remove("client-on");
+        isMeetingAudioLive = false;
+        btnMeetingAudio.classList.remove("client-live", "connecting");
+        badgeMeetingAudio.textContent = "START";
+        updateOverallState();
+        checkIfAllStopped();
         break;
+
       case "MEETING_AUDIO_ERROR":
-        pillClient.classList.remove("client-on");
+        isMeetingAudioLive = false;
+        btnMeetingAudio.classList.remove("client-live", "connecting");
+        badgeMeetingAudio.textContent = "START";
+        updateOverallState();
         showError(message.error);
         break;
+
       case "START_MIC":
-        if (!listening) startAllAudio();
+        if (!isMyAudioLive) startMyAudio();
         break;
+
       case "CLIENT_TRANSCRIPT":
         if (message.isFinal) {
           setInterim("CLIENT", "");
@@ -1111,6 +1185,10 @@ AI Copilot Team`
     }
   });
 
-  window.addEventListener("beforeunload", stopAllAudio);
+  window.addEventListener("beforeunload", () => {
+    stopMyAudio();
+    stopMeetingAudio();
+  });
+
   setState("READY");
 })();
