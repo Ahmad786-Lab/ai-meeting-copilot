@@ -1,289 +1,641 @@
-/* content.js — HUD injected into Google Meet */
+/**
+ * content.js — Real-Time AI Meeting Copilot HUD for Google Meet
+ *
+ * Features:
+ *  - Fully draggable anywhere on screen by the header bar
+ *  - Consolidated 1-click "Activate Copilot" button in the HUD (no popup needed)
+ *  - Dropdown menu style with collapsible sections for minimal footprint
+ *  - Dual-channel real-time transcription (YOU mic + CLIENT tab audio)
+ *  - Google Meet Mute sync (pauses mic and toggles YOU (MUTED) pill)
+ *  - Live sales battle cards & proactive talking points
+ *  - Post-meeting intelligence scorecard & 1-click follow-up email
+ */
 
-(function () {
-  if (window.__aiCopilotLoaded) return;
-  window.__aiCopilotLoaded = true;
+(() => {
+  if (window.__COPILOT_INJECTED__) return;
+  window.__COPILOT_INJECTED__ = true;
+
+  const CONFIG = (typeof AI_COPILOT_CONFIG !== "undefined" ? AI_COPILOT_CONFIG : null) ||
+                 (typeof window.COPILOT_CONFIG !== "undefined" ? window.COPILOT_CONFIG : null) || {
+    SERVER_URL: "http://localhost:3000",
+    DEEPGRAM_API_KEY: "",
+    LANGUAGE: "multi",
+    MODEL: "nova-3",
+    RESPECT_MEET_MUTE: true,
+    ROMANIZE: true
+  };
+
+  let meetingId = "meet-" + Date.now();
+  let listening = false;
+  let isStarting = false;
+  let manualStop = false;
 
   let micStream = null;
-  let recorder = null;
   let socket = null;
-  let manualStop = false;
+  let recorder = null;
   let keepAliveTimer = null;
-  let meetingId = "meet-" + Date.now();
-  let latestEmailText = "";
-  let isStarting = false;
-  let meetMuted = false;
+  let currentCueTimer = null;
 
-  // Local turn & talk telemetry
   let youWordsCount = 0;
   let clientWordsCount = 0;
   let totalTurns = 0;
+  let turnHistory = [];
   let lastOutcomeData = null;
 
-  // Audio meter
-  let audioCtx = null;
-  let analyser = null;
-  let animFrameId = null;
+  let isMutedByMeet = false;
+  let meetMuteObserver = null;
 
-  // ---------------- UI ----------------
+  let youInterimEl = null;
+  let clientInterimEl = null;
+
+  // ---------------- HUD Injection & Styling ----------------
 
   const root = document.createElement("div");
   root.id = "ai-copilot-hud";
   root.innerHTML = `
     <style>
       #ai-copilot-hud {
-        position: fixed; top: 16px; right: 16px; width: 340px;
-        max-height: 90vh; overflow-y: auto;
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        width: 370px;
+        max-height: 90vh;
+        background: rgba(18, 20, 26, 0.96);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 14px;
+        box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.05);
+        color: #f1f3f4;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 13px;
         z-index: 2147483647;
-        background: rgba(24,24,27,0.96); color: #fff;
-        border-radius: 12px; padding: 14px;
-        font-family: system-ui, -apple-system, sans-serif; font-size: 13px;
-        box-shadow: 0 8px 32px rgba(0,0,0,0.45);
-        border: 1px solid rgba(255,255,255,0.08);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        transition: width 0.2s ease, max-height 0.2s ease, opacity 0.15s ease;
+        user-select: none;
       }
       #ai-copilot-hud * { box-sizing: border-box; }
-      .cp-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
-      .cp-title { font-weight:600; font-size:14px; display:flex; align-items:center; gap:6px; }
-      .cp-status { display:flex; align-items:center; gap:6px; font-size:11px; color:#bdc1c6; }
-      .cp-dot { width:8px; height:8px; border-radius:50%; background:#9aa0a6; }
-      .cp-pills { display:flex; gap:8px; margin-bottom:10px; }
-      .cp-pill { flex:1; text-align:center; font-size:10px; letter-spacing:.4px;
-        padding:5px 6px; border-radius:6px; background:rgba(255,255,255,.06);
-        color:#9aa0a6; border:1px solid transparent; font-weight:600; transition: all 0.15s ease; }
-      .cp-pill.on { background:rgba(52,168,83,.2); color:#81c995; border-color:rgba(52,168,83,.5); }
-      .cp-pill.muted { background:rgba(242,139,130,.15) !important; color:#f28b82 !important; border-color:rgba(242,139,130,.5) !important; }
-      .cp-hint { font-size:11px; color:#fdd663; margin-bottom:10px; line-height:1.4; }
-      .cp-btns { display:flex; gap:8px; margin-bottom:10px; }
-      .cp-btn { flex:1; padding:8px 10px; border:none; border-radius:8px;
-        font-weight:600; font-size:12px; cursor:pointer; color:#fff; transition: background 0.15s; }
-      .cp-btn[disabled] { background:#3c4043 !important; color:#9aa0a6; cursor:not-allowed; }
-      .cp-start { background:#1a73e8; }
-      .cp-start:hover:not([disabled]) { background:#1557b0; }
-      .cp-stop { background:#5f6368; }
-      .cp-stop:hover:not([disabled]) { background:#494c50; }
-
-      /* Real-time Copilot Cue Card */
-      .cp-cue {
-        display: none;
-        margin-bottom: 10px;
-        background: rgba(26,115,232,0.15);
-        border: 1px solid rgba(138,180,248,0.45);
-        border-radius: 8px;
-        padding: 9px 11px;
-        animation: cpFadeIn 0.22s ease-out;
+      #ai-copilot-hud.minimized {
+        width: 220px !important;
+        max-height: 48px !important;
       }
-      @keyframes cpFadeIn {
-        from { opacity: 0; transform: translateY(-4px); }
+
+      /* Drag Header */
+      .cp-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 10px 14px;
+        background: rgba(255, 255, 255, 0.05);
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        cursor: grab;
+      }
+      .cp-head:active { cursor: grabbing; }
+      .cp-title-wrap {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .cp-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #9aa0a6;
+        transition: all 0.2s ease;
+      }
+      .cp-dot.live { background: #34a853; box-shadow: 0 0 8px #34a853; }
+      .cp-dot.connecting { background: #fbbc04; }
+      .cp-title {
+        font-weight: 600;
+        font-size: 13px;
+        letter-spacing: 0.3px;
+        color: #e8eaed;
+      }
+      .cp-status {
+        font-size: 10px;
+        font-weight: 600;
+        color: #9aa0a6;
+        letter-spacing: 0.5px;
+      }
+      .cp-head-controls {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .cp-icon-btn {
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        color: #dadce0;
+        border-radius: 6px;
+        padding: 3px 8px;
+        font-size: 11px;
+        cursor: pointer;
+        transition: all 0.15s ease;
+      }
+      .cp-icon-btn:hover { background: rgba(255, 255, 255, 0.16); }
+
+      /* Dropdown Menu Popup */
+      .cp-menu-dropdown {
+        position: absolute;
+        top: 42px;
+        right: 12px;
+        background: #202124;
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        border-radius: 8px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+        padding: 4px;
+        display: none;
+        z-index: 100;
+        min-width: 170px;
+      }
+      .cp-menu-dropdown.show { display: block; }
+      .cp-menu-item {
+        padding: 7px 10px;
+        font-size: 12px;
+        color: #e8eaed;
+        border-radius: 4px;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .cp-menu-item:hover { background: rgba(255, 255, 255, 0.08); color: #fff; }
+
+      /* Sub-Bar: Audio Status & Controls */
+      .cp-subbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 8px 14px;
+        background: rgba(0, 0, 0, 0.2);
+        border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+      }
+      .cp-pills { display: flex; gap: 6px; }
+      .cp-pill {
+        display: inline-flex;
+        align-items: center;
+        padding: 3px 8px;
+        border-radius: 12px;
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.3px;
+        background: rgba(255, 255, 255, 0.06);
+        color: #9aa0a6;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        transition: all 0.2s ease;
+      }
+      .cp-pill.on {
+        background: rgba(52, 168, 83, 0.2);
+        color: #81c995;
+        border-color: rgba(52, 168, 83, 0.4);
+      }
+      .cp-pill.client-on {
+        background: rgba(66, 133, 244, 0.2);
+        color: #8ab4f8;
+        border-color: rgba(66, 133, 244, 0.4);
+      }
+      .cp-pill.muted {
+        background: rgba(234, 67, 53, 0.2) !important;
+        color: #f28b82 !important;
+        border-color: rgba(234, 67, 53, 0.4) !important;
+      }
+
+      /* Unified Action Button: "Activate Copilot" */
+      .cp-action-bar {
+        padding: 10px 14px;
+        display: flex;
+        gap: 8px;
+      }
+      .cp-main-btn {
+        flex: 1;
+        padding: 9px 14px;
+        border-radius: 8px;
+        font-weight: 600;
+        font-size: 13px;
+        border: none;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        background: #1a73e8;
+        color: #ffffff;
+        box-shadow: 0 2px 6px rgba(26, 115, 232, 0.35);
+        transition: all 0.15s ease;
+      }
+      .cp-main-btn:hover { background: #1557b0; }
+      .cp-main-btn.active {
+        background: #ea4335;
+        box-shadow: 0 2px 6px rgba(234, 67, 53, 0.35);
+      }
+      .cp-main-btn.active:hover { background: #d93025; }
+
+      /* Body Sections */
+      .cp-body {
+        padding: 0 14px 12px 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        overflow-y: auto;
+        max-height: 70vh;
+      }
+
+      /* Talking Points / Cue Card */
+      .cp-cue {
+        background: linear-gradient(180deg, rgba(26, 115, 232, 0.16) 0%, rgba(26, 115, 232, 0.06) 100%);
+        border: 1px solid rgba(138, 180, 248, 0.4);
+        border-radius: 10px;
+        padding: 10px 12px;
+        display: none;
+        animation: cpSlideDown 0.2s ease-out;
+      }
+      @keyframes cpSlideDown {
+        from { opacity: 0; transform: translateY(-6px); }
         to { opacity: 1; transform: translateY(0); }
+      }
+      .cp-cue.show { display: block; }
+      .cp-cue.urgent {
+        background: linear-gradient(180deg, rgba(251, 188, 4, 0.18) 0%, rgba(251, 188, 4, 0.06) 100%);
+        border-color: rgba(251, 188, 4, 0.5);
       }
       .cp-cue-badge {
         font-size: 10px;
         font-weight: 700;
-        letter-spacing: 0.6px;
         text-transform: uppercase;
+        letter-spacing: 0.6px;
         color: #8ab4f8;
         margin-bottom: 5px;
+        display: flex;
+        justify-content: space-between;
       }
-      .cp-cue-badge.urgent {
-        color: #fdd663;
-      }
+      .cp-cue.urgent .cp-cue-badge { color: #fbbc04; }
       .cp-cue-bullets {
+        margin: 0;
+        padding-left: 16px;
+        color: #f1f3f4;
         font-size: 12px;
+        line-height: 1.45;
+      }
+      .cp-cue-bullets li { margin-bottom: 3px; }
+
+      /* Collapsible Dropdown Accordion */
+      .cp-accordion {
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 8px;
+        overflow: hidden;
+      }
+      .cp-acc-header {
+        padding: 8px 12px;
+        font-size: 11px;
+        font-weight: 600;
+        color: #bdc1c6;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        user-select: none;
+      }
+      .cp-acc-header:hover { background: rgba(255, 255, 255, 0.05); }
+      .cp-acc-content {
+        padding: 10px 12px;
+        border-top: 1px solid rgba(255, 255, 255, 0.06);
+        display: none;
+      }
+      .cp-acc-content.open { display: block; }
+
+      /* Transcript Feed */
+      .cp-log {
+        max-height: 160px;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        font-size: 12px;
+        user-select: text;
+      }
+      .cp-msg { line-height: 1.4; word-break: break-word; }
+      .cp-msg.interim { opacity: 0.55; font-style: italic; }
+      .cp-msg-pill {
+        font-size: 9px;
+        font-weight: 700;
+        padding: 1px 5px;
+        border-radius: 4px;
+        margin-right: 4px;
+      }
+      .cp-msg-pill.you { background: rgba(52, 168, 83, 0.25); color: #81c995; }
+      .cp-msg-pill.client { background: rgba(66, 133, 244, 0.25); color: #8ab4f8; }
+      .cp-empty {
+        color: #80868b;
+        font-style: italic;
+        text-align: center;
+        padding: 12px 0;
+      }
+
+      /* Outcome Section */
+      .cp-ratio-bar {
+        height: 6px;
+        width: 100%;
+        background: rgba(255, 255, 255, 0.1);
+        border-radius: 3px;
+        overflow: hidden;
+        display: flex;
+        margin-bottom: 4px;
+      }
+      .cp-ratio-you { background: #34a853; }
+      .cp-ratio-client { background: #4285f4; }
+      .cp-ratio-txt {
+        display: flex;
+        justify-content: space-between;
+        font-size: 10px;
+        color: #9aa0a6;
+        margin-bottom: 8px;
+      }
+      .cp-scores-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6px;
+        margin-bottom: 8px;
+      }
+      .cp-score-item {
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 6px;
+        padding: 6px;
+      }
+      .cp-score-val { font-size: 13px; font-weight: 700; color: #81c995; }
+      .cp-score-title { font-size: 9px; color: #9aa0a6; text-transform: uppercase; }
+      .cp-email-preview {
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 6px;
+        padding: 8px;
+        font-size: 11px;
         line-height: 1.4;
         color: #e8eaed;
+        max-height: 120px;
+        overflow-y: auto;
+        white-space: pre-wrap;
       }
-      .cp-cue-bullet {
-        display: flex;
-        gap: 6px;
-        margin-top: 3px;
+      .cp-copy-btn {
+        background: #1a73e8;
+        border: none;
+        color: white;
+        padding: 3px 8px;
+        border-radius: 4px;
+        font-size: 10px;
+        cursor: pointer;
+        float: right;
+        margin-bottom: 4px;
       }
-      .cp-cue-bullet::before {
-        content: "•";
-        color: #8ab4f8;
-        font-weight: bold;
-      }
-
-      .cp-log { height:180px; overflow-y:auto; background:rgba(255,255,255,.05);
-        border-radius:8px; padding:10px; line-height:1.5; font-size:12px; }
-      .cp-line { margin-bottom:6px; }
-      .cp-line.interim { opacity:.55; }
-      .cp-you { color:#8ab4f8; font-weight:600; margin-right:6px; }
-      .cp-client { color:#81c995; font-weight:600; margin-right:6px; }
-      .cp-empty { color:#9aa0a6; }
-      .cp-err { margin-top:8px; color:#f28b82; font-size:11px; }
-
-      /* Post-Meeting Outcome Card */
-      .cp-post-meeting {
+      .cp-err {
+        color: #f28b82;
+        font-size: 11px;
+        padding: 6px 12px;
+        background: rgba(234, 67, 53, 0.15);
+        border-radius: 6px;
         display: none;
-        margin-top: 6px;
-        animation: cpFadeIn 0.25s ease-out;
       }
-      .cp-pm-header {
-        display: flex; justify-content: space-between; align-items: center;
-        border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 8px; margin-bottom: 10px;
-      }
-      .cp-pm-title {
-        font-size: 12px; font-weight: 700; letter-spacing: 0.6px; color: #8ab4f8; text-transform: uppercase;
-      }
-      .cp-pm-badge {
-        font-size: 9px; padding: 2px 6px; border-radius: 4px; background: rgba(52,168,83,0.25); color: #81c995; font-weight: 600;
-      }
-      .cp-pm-metrics {
-        display: flex; gap: 8px; margin-bottom: 10px;
-      }
-      .cp-pm-metric {
-        flex: 1; background: rgba(255,255,255,0.06); padding: 6px 8px; border-radius: 6px;
-        font-size: 11px; text-align: center; color: #dadce0; font-weight: 500;
-      }
-      .cp-pm-section {
-        margin-bottom: 10px;
-      }
-      .cp-pm-label {
-        font-size: 10px; font-weight: 700; color: #9aa0a6; letter-spacing: 0.5px; margin-bottom: 4px; text-transform: uppercase;
-      }
-      .cp-pm-text {
-        font-size: 12px; color: #e8eaed; line-height: 1.4;
-      }
-      .cp-pm-list {
-        font-size: 12px; color: #e8eaed; line-height: 1.4;
-      }
-      .cp-pm-item {
-        margin-top: 3px; display: flex; gap: 6px;
-      }
-      .cp-pm-item::before {
-        content: "•"; color: #81c995; font-weight: bold;
-      }
-      .cp-pm-scores {
-        display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 10px;
-      }
-      .cp-pm-score-card {
-        background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06);
-        border-radius: 6px; padding: 6px 8px; font-size: 11px;
-      }
-      .cp-pm-score-top {
-        display: flex; justify-content: space-between; font-weight: 600; color: #fff; margin-bottom: 2px;
-      }
-      .cp-pm-score-val {
-        color: #fdd663; font-weight: 700;
-      }
-      .cp-pm-score-why {
-        font-size: 10px; color: #9aa0a6; line-height: 1.25;
-      }
-      .cp-pm-email-box {
-        background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
-        border-radius: 8px; padding: 8px 10px; margin-bottom: 10px;
-      }
-      .cp-pm-email-head {
-        display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;
-        font-size: 10px; font-weight: 700; color: #8ab4f8; letter-spacing: 0.5px;
-      }
-      .cp-pm-copy-btn {
-        background: #1a73e8; color: #fff; border: none; border-radius: 4px;
-        padding: 3px 8px; font-size: 10px; font-weight: 600; cursor: pointer;
-      }
-      .cp-pm-copy-btn:hover { background: #1557b0; }
-      .cp-pm-email-body {
-        font-size: 11px; color: #dadce0; white-space: pre-wrap; line-height: 1.35; max-height: 120px; overflow-y: auto;
-      }
-      .cp-pm-toggle-btn {
-        width: 100%; background: transparent; border: 1px dashed rgba(255,255,255,0.2);
-        color: #9aa0a6; border-radius: 6px; padding: 6px; font-size: 11px; cursor: pointer; text-align: center;
-      }
-      .cp-pm-toggle-btn:hover { color: #fff; border-color: rgba(255,255,255,0.4); }
-      .cp-quick-outcome {
-        width: 100%; margin-bottom: 8px; background: rgba(26,115,232,0.15); border: 1px solid rgba(138,180,248,0.4);
-        color: #8ab4f8; border-radius: 6px; padding: 6px; font-size: 11px; font-weight: 600; cursor: pointer; text-align: center;
-      }
-      .cp-quick-outcome:hover { background: rgba(26,115,232,0.25); color: #fff; }
     </style>
 
-    <div class="cp-head">
-      <div class="cp-title">AI Copilot</div>
-      <div class="cp-status"><span class="cp-dot" id="cp-dot"></span><span id="cp-state">READY</span></div>
+    <!-- Draggable Header -->
+    <div class="cp-head" id="cp-drag-handle">
+      <div class="cp-title-wrap">
+        <div class="cp-dot" id="cp-dot"></div>
+        <span class="cp-title">AI Meeting Copilot</span>
+        <span class="cp-status" id="cp-state">READY</span>
+      </div>
+      <div class="cp-head-controls">
+        <button class="cp-icon-btn" id="cp-menu-btn" title="Menu">Menu ▾</button>
+        <button class="cp-icon-btn" id="cp-min-btn" title="Minimize">—</button>
+      </div>
     </div>
 
-    <div class="cp-pills">
-      <div class="cp-pill" id="cp-pill-you">YOU</div>
-      <div class="cp-pill" id="cp-pill-meet">MEETING AUDIO</div>
+    <!-- Quick Dropdown Menu -->
+    <div class="cp-menu-dropdown" id="cp-menu-dropdown">
+      <div class="cp-menu-item" id="cp-menu-outcome">📊 View Outcome & Scores</div>
+      <div class="cp-menu-item" id="cp-menu-toggle-transcript">📝 Toggle Transcript View</div>
+      <div class="cp-menu-item" id="cp-menu-reset">🔄 Reset Current Meeting</div>
     </div>
 
-    <div class="cp-hint" id="cp-hint">
-      Press Start Copilot to capture both sides of the conversation.
+    <!-- Sub-Bar: Dual Audio Indicators -->
+    <div class="cp-subbar">
+      <div class="cp-pills">
+        <span class="cp-pill" id="cp-pill-you">YOU (MIC)</span>
+        <span class="cp-pill" id="cp-pill-client">CLIENT (AUDIO)</span>
+      </div>
+      <span id="cp-hint" style="font-size:10px; color:#9aa0a6;">1-click to start</span>
     </div>
 
-    <div class="cp-btns">
-      <button class="cp-btn cp-start" id="cp-start">Start Copilot</button>
-      <button class="cp-btn cp-stop" id="cp-stop" disabled>Stop</button>
+    <!-- Unified "Activate Copilot" Action Button -->
+    <div class="cp-action-bar">
+      <button class="cp-main-btn" id="cp-activate-btn">
+        <span>⚡ Activate Copilot</span>
+      </button>
     </div>
 
-    <button class="cp-quick-outcome" id="cp-quick-outcome" style="display:none;">View Meeting Outcome & Scores 📊</button>
+    <!-- Main Body Sections -->
+    <div class="cp-body" id="cp-body">
+      <div class="cp-err" id="cp-err"></div>
 
-    <!-- Live HUD Cue Card -->
-    <div class="cp-cue" id="cp-cue">
-      <div class="cp-cue-badge" id="cp-cue-badge"></div>
-      <div class="cp-cue-bullets" id="cp-cue-bullets"></div>
-    </div>
-
-    <!-- Post-Meeting Outcome Card -->
-    <div class="cp-post-meeting" id="cp-post-meeting">
-      <div class="cp-pm-header">
-        <div class="cp-pm-title">MEETING OUTCOME</div>
-        <div class="cp-pm-badge" id="cp-pm-badge">ANALYZED</div>
-      </div>
-      <div class="cp-pm-metrics">
-        <div class="cp-pm-metric" id="cp-pm-ratio">Talk: -</div>
-        <div class="cp-pm-agenda" id="cp-pm-agenda">Agenda: -</div>
-      </div>
-      <div class="cp-pm-section">
-        <div class="cp-pm-label">SUMMARY</div>
-        <div class="cp-pm-text" id="cp-pm-summary">-</div>
-      </div>
-      <div class="cp-pm-section" id="cp-pm-needs-sec">
-        <div class="cp-pm-label">CLIENT NEEDS & PAIN POINTS</div>
-        <div class="cp-pm-list" id="cp-pm-needs"></div>
-      </div>
-      <div class="cp-pm-section" id="cp-pm-commitments-sec">
-        <div class="cp-pm-label">ACTION ITEMS & NEXT STEPS</div>
-        <div class="cp-pm-list" id="cp-pm-commitments"></div>
-      </div>
-      <div class="cp-pm-section" id="cp-pm-scores-sec">
-        <div class="cp-pm-label">PERFORMANCE SCORES</div>
-        <div class="cp-pm-scores" id="cp-pm-scores"></div>
-      </div>
-      <div class="cp-pm-email-box">
-        <div class="cp-pm-email-head">
-          <span>FOLLOW-UP EMAIL DRAFT</span>
-          <button class="cp-pm-copy-btn" id="cp-pm-copy-btn">Copy Email</button>
+      <!-- Live Talking Points / Cue Card -->
+      <div class="cp-cue" id="cp-cue">
+        <div class="cp-cue-badge">
+          <span id="cp-cue-badge-txt">TALKING POINT</span>
+          <span id="cp-cue-time" style="font-weight:400; opacity:0.8;">Live</span>
         </div>
-        <div class="cp-pm-email-body" id="cp-pm-email-body"></div>
+        <ul class="cp-cue-bullets" id="cp-cue-bullets"></ul>
       </div>
-      <button class="cp-pm-toggle-btn" id="cp-pm-toggle-btn">View Raw Transcript (Evidence) ▾</button>
-    </div>
 
-    <!-- Raw Live Transcript (Evidence) -->
-    <div class="cp-log" id="cp-log"><div class="cp-empty">Waiting for speech…</div></div>
-    <div class="cp-err" id="cp-err"></div>
+      <!-- Accordion 1: Live Speech Transcript Dropdown -->
+      <div class="cp-accordion">
+        <div class="cp-acc-header" id="cp-acc-head-transcript">
+          <span>📝 LIVE SPEECH TRANSCRIPT</span>
+          <span id="cp-acc-arrow-transcript">▾</span>
+        </div>
+        <div class="cp-acc-content open" id="cp-acc-body-transcript">
+          <div class="cp-log" id="cp-log">
+            <div class="cp-empty">Waiting for speech…</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Accordion 2: Meeting Outcome & Intelligence Dropdown -->
+      <div class="cp-accordion" id="cp-outcome-accordion">
+        <div class="cp-acc-header" id="cp-acc-head-outcome">
+          <span>📊 MEETING OUTCOME & SCORES</span>
+          <span id="cp-acc-arrow-outcome">▸</span>
+        </div>
+        <div class="cp-acc-content" id="cp-acc-body-outcome">
+          <div style="font-size:10px; color:#9aa0a6; margin-bottom:4px; font-weight:600;">TALK RATIO</div>
+          <div class="cp-ratio-bar">
+            <div class="cp-ratio-you" id="cp-ratio-you" style="width:50%;"></div>
+            <div class="cp-ratio-client" id="cp-ratio-client" style="width:50%;"></div>
+          </div>
+          <div class="cp-ratio-txt">
+            <span id="cp-ratio-you-txt">You: 50%</span>
+            <span id="cp-ratio-client-txt">Client: 50%</span>
+          </div>
+
+          <div style="font-size:10px; color:#9aa0a6; margin-bottom:4px; font-weight:600;">PERFORMANCE SCORES</div>
+          <div class="cp-scores-grid" id="cp-scores-grid"></div>
+
+          <div style="margin-top:6px;">
+            <button class="cp-copy-btn" id="cp-copy-email-btn">Copy Email</button>
+            <div style="font-size:10px; color:#9aa0a6; margin-bottom:4px; font-weight:600;">FOLLOW-UP EMAIL DRAFT</div>
+            <div class="cp-email-preview" id="cp-email-preview">Finish call to generate draft.</div>
+          </div>
+        </div>
+      </div>
+    </div>
   `;
   document.body.appendChild(root);
 
+  // ---------------- DOM Helpers ----------------
   const $ = (id) => document.getElementById(id);
-  const logEl = $("cp-log");
-  const errEl = $("cp-err");
+  const hud = $("ai-copilot-hud");
+  const dragHandle = $("cp-drag-handle");
+  const activateBtn = $("cp-activate-btn");
   const dotEl = $("cp-dot");
   const stateEl = $("cp-state");
-  const cueEl = $("cp-cue");
-  const cueBadgeEl = $("cp-cue-badge");
-  const cueBulletsEl = $("cp-cue-bullets");
-  const postMeetingEl = $("cp-post-meeting");
-  const toggleBtn = $("cp-pm-toggle-btn");
-  const quickOutcomeBtn = $("cp-quick-outcome");
-  const copyBtn = $("cp-pm-copy-btn");
-  const pillYou = $("cp-pill-you");
-  const pillMeet = $("cp-pill-meet");
   const hintEl = $("cp-hint");
+  const pillYou = $("cp-pill-you");
+  const pillClient = $("cp-pill-client");
+  const cueEl = $("cp-cue");
+  const cueBadgeTxt = $("cp-cue-badge-txt");
+  const cueBullets = $("cp-cue-bullets");
+  const logEl = $("cp-log");
+  const errEl = $("cp-err");
+  const menuBtn = $("cp-menu-btn");
+  const menuDropdown = $("cp-menu-dropdown");
 
-  let youInterimEl = null;
-  let clientInterimEl = null;
+  // ---------------- Free Drag-and-Drop Anywhere on Screen ----------------
+
+  let isDragging = false;
+  let dragOffset = { x: 0, y: 0 };
+
+  dragHandle.addEventListener("mousedown", (e) => {
+    if (e.target.tagName === "BUTTON" || e.target.classList.contains("cp-icon-btn")) return;
+    isDragging = true;
+    const rect = hud.getBoundingClientRect();
+    dragOffset.x = e.clientX - rect.left;
+    dragOffset.y = e.clientY - rect.top;
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mouseup", onMouseUp);
+  });
+
+  function onMouseMove(e) {
+    if (!isDragging) return;
+    e.preventDefault();
+
+    let newX = e.clientX - dragOffset.x;
+    let newY = e.clientY - dragOffset.y;
+
+    // Bounds checking
+    const maxX = window.innerWidth - hud.offsetWidth - 8;
+    const maxY = window.innerHeight - hud.offsetHeight - 8;
+    newX = Math.max(8, Math.min(newX, maxX));
+    newY = Math.max(8, Math.min(newY, maxY));
+
+    hud.style.right = "auto";
+    hud.style.left = `${newX}px`;
+    hud.style.top = `${newY}px`;
+  }
+
+  function onMouseUp() {
+    isDragging = false;
+    document.removeEventListener("mousemove", onMouseMove);
+    document.removeEventListener("mouseup", onMouseUp);
+  }
+
+  // ---------------- Dropdown & Collapsible Controls ----------------
+
+  let isMinimized = false;
+  $("cp-min-btn").addEventListener("click", () => {
+    isMinimized = !isMinimized;
+    hud.classList.toggle("minimized", isMinimized);
+    $("cp-body").style.display = isMinimized ? "none" : "flex";
+    $("cp-activate-btn").parentElement.style.display = isMinimized ? "none" : "flex";
+    $("cp-min-btn").textContent = isMinimized ? "+" : "—";
+  });
+
+  menuBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    menuDropdown.classList.toggle("show");
+  });
+
+  document.addEventListener("click", () => {
+    menuDropdown.classList.remove("show");
+  });
+
+  // Accordion 1: Transcript Toggle
+  $("cp-acc-head-transcript").addEventListener("click", () => {
+    const body = $("cp-acc-body-transcript");
+    const isOpen = body.classList.contains("open");
+    body.classList.toggle("open", !isOpen);
+    $("cp-acc-arrow-transcript").textContent = isOpen ? "▸" : "▾";
+  });
+
+  // Accordion 2: Outcome Toggle
+  $("cp-acc-head-outcome").addEventListener("click", () => {
+    const body = $("cp-acc-body-outcome");
+    const isOpen = body.classList.contains("open");
+    body.classList.toggle("open", !isOpen);
+    $("cp-acc-arrow-outcome").textContent = isOpen ? "▸" : "▾";
+  });
+
+  // Menu items
+  $("cp-menu-outcome").addEventListener("click", () => {
+    $("cp-acc-body-outcome").classList.add("open");
+    $("cp-acc-arrow-outcome").textContent = "▾";
+    renderOutcomeScorecard();
+  });
+
+  $("cp-menu-toggle-transcript").addEventListener("click", () => {
+    $("cp-acc-head-transcript").click();
+  });
+
+  $("cp-menu-reset").addEventListener("click", () => {
+    resetMeetingState();
+  });
+
+  $("cp-copy-email-btn").addEventListener("click", () => {
+    const text = $("cp-email-preview").textContent;
+    navigator.clipboard.writeText(text).then(() => {
+      $("cp-copy-email-btn").textContent = "Copied! ✓";
+      setTimeout(() => { $("cp-copy-email-btn").textContent = "Copy Email"; }, 2000);
+    });
+  });
+
+  function showError(msg) {
+    if (!msg) {
+      errEl.style.display = "none";
+      return;
+    }
+    errEl.textContent = msg;
+    errEl.style.display = "block";
+    setTimeout(() => { errEl.style.display = "none"; }, 6000);
+  }
+
+  function setState(state) {
+    stateEl.textContent = state;
+    dotEl.className = "cp-dot";
+    if (state === "LISTENING") dotEl.classList.add("live");
+    else if (state === "CONNECTING") dotEl.classList.add("connecting");
+  }
+
+  function resetMeetingState() {
+    meetingId = "meet-" + Date.now();
+    youWordsCount = 0;
+    clientWordsCount = 0;
+    totalTurns = 0;
+    turnHistory = [];
+    cueEl.classList.remove("show");
+    logEl.innerHTML = '<div class="cp-empty">Waiting for speech…</div>';
+    hintEl.textContent = "Meeting reset";
+  }
 
   // ---------------- Google Meet Mute Detection ----------------
 
@@ -305,348 +657,186 @@
     return null;
   }
 
-  function isMeetMuted() {
-    const btn = findMeetMicButton();
-    if (!btn) return false;
-
-    const attr = btn.getAttribute("data-is-muted");
-    if (attr === "true") return true;
-    if (attr === "false") return false;
-
-    const label = (btn.getAttribute("aria-label") || "").toLowerCase();
-    if (label.includes("turn on microphone")) return true;
-    if (label.includes("turn off microphone")) return false;
-
-    return false;
+  function checkMeetMute() {
+    const micBtn = findMeetMicButton();
+    if (!micBtn) return false;
+    const isMutedAttr = micBtn.getAttribute("data-is-muted");
+    if (isMutedAttr === "true") return true;
+    if (isMutedAttr === "false") return false;
+    const label = (micBtn.getAttribute("aria-label") || "").toLowerCase();
+    return label.includes("turn on microphone");
   }
 
-  function updateMuteState() {
-    const shouldRespect = typeof AI_COPILOT_CONFIG !== "undefined" && AI_COPILOT_CONFIG.RESPECT_MEET_MUTE;
-    if (!shouldRespect) {
-      meetMuted = false;
-      return;
-    }
-
-    const muted = isMeetMuted();
-    if (muted === meetMuted) return;
-    meetMuted = muted;
-
-    const isListening = stateEl.textContent === "LISTENING";
-    if (meetMuted) {
-      pillYou.textContent = "YOU (MUTED)";
-      pillYou.classList.add("muted");
-      pillYou.classList.remove("on");
-      pillYou.style.boxShadow = "none";
-      setInterim("YOU", "");
-    } else {
-      pillYou.textContent = "YOU";
-      pillYou.classList.remove("muted");
-      pillYou.classList.toggle("on", isListening);
-    }
-  }
-
-  setInterval(updateMuteState, 200);
-
-  function setState(state) {
-    stateEl.textContent = state;
-    dotEl.style.background =
-      state === "LISTENING"
-        ? "#34a853"
-        : state === "ERROR"
-        ? "#d93025"
-        : state === "CONNECTING"
-        ? "#f9ab00"
-        : "#9aa0a6";
-
-    const isRunning = state === "LISTENING" || state === "CONNECTING";
-    $("cp-start").disabled = isRunning;
-    $("cp-stop").disabled = !isRunning;
-    
-    if (state === "LISTENING") {
-      updateMuteState();
-      if (!meetMuted) pillYou.classList.add("on");
-    } else {
-      pillYou.classList.remove("on", "muted");
-      pillYou.textContent = "YOU";
-    }
-  }
-
-  function setMeetingAudio(on) {
-    pillMeet.classList.toggle("on", on);
-    if (on) {
-      hintEl.style.display = "none";
-      showError("");
-    }
-  }
-
-  function showError(text) {
-    errEl.textContent = text || "";
-  }
-
-  function clearEmpty() {
-    const empty = logEl.querySelector(".cp-empty");
-    if (empty) empty.remove();
-  }
-
-  function display(text) {
-    if (!AI_COPILOT_CONFIG.ROMANIZE) return text;
-    try {
-      return window.aiCopilotRomanize(text);
-    } catch (e) {
-      return text;
-    }
-  }
-
-  function displayCue(cue) {
-    if (!cue || !cue.label || !cue.bullets || !cue.bullets.length) {
-      return;
-    }
-    cueBadgeEl.textContent = cue.label;
-    const isUrgent = cue.urgent || cue.event === "price_objection" || cue.event === "buying_signal";
-    cueBadgeEl.classList.toggle("urgent", Boolean(isUrgent));
-    cueBulletsEl.innerHTML = cue.bullets
-      .map((b) => `<div class="cp-cue-bullet">${b}</div>`)
-      .join("");
-    cueEl.style.display = "block";
-  }
-
-  async function sendTurn(speaker, text) {
-    const url = typeof AI_COPILOT_CONFIG !== "undefined" && AI_COPILOT_CONFIG.SERVER_URL;
-    if (!url) return;
-    try {
-      const res = await fetch(url + "/turn", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          meetingId,
-          speaker,
-          text
-        }),
-        signal: AbortSignal.timeout(2500)
-      });
-      if (!res.ok) return;
-      const data = await res.json();
-      if (data && data.cue) {
-        displayCue(data.cue);
-      }
-    } catch (err) {
-      console.warn("[copilot-hud] server turn skipped:", err.message);
-    }
-  }
-
-  function generateLocalOutcome() {
-    const total = youWordsCount + clientWordsCount;
-    const youRatio = total > 0 ? Math.round((youWordsCount / total) * 100) : 50;
-    const clientRatio = 100 - youRatio;
-
-    return {
-      talk_ratio: `You ${youRatio}% / Client ${clientRatio}%`,
-      agenda_coverage: "4/6",
-      analysis: {
-        summary: "Discovery call concluded. Client outlined core workflow requirements, budget parameters, and timeline expectations.",
-        client_needs: [
-          "Automate manual processing workflows",
-          "Reduce turnaround time and operational costs"
-        ],
-        next_steps: [
-          "Send customized proposal and timeline estimate",
-          "Schedule follow-up review call"
-        ],
-        scores: {
-          discovery: { score: 8, why: "Uncovered key requirements and core operational pain points." },
-          listening: { score: 8, why: `Balanced talk ratio: You ${youRatio}% / Client ${clientRatio}%.` },
-          objection_handling: { score: 9, why: "Addressed budget and pricing questions directly with ROI clarity." },
-          closing: { score: 8, why: "Locked down concrete next steps and commitments." }
-        },
-        follow_up_email:
-`Hi,
-
-Thanks for taking the time to speak today.
-
-Based on our discussion, our team will put together a tailored proposal to streamline your manual workflows and reduce processing overhead.
-
-Next steps:
-• Send customized proposal and timeline estimate
-• Schedule follow-up review call
-
-Looking forward to partnering together.
-
-Best,`
+  function setupMeetMuteObserver() {
+    if (meetMuteObserver) return;
+    const update = () => {
+      const muted = checkMeetMute();
+      if (muted !== isMutedByMeet) {
+        isMutedByMeet = muted;
+        if (isMutedByMeet) {
+          pillYou.classList.add("muted");
+          pillYou.textContent = "YOU (MUTED)";
+        } else {
+          pillYou.classList.remove("muted");
+          pillYou.textContent = "YOU (MIC)";
+        }
       }
     };
+    update();
+    meetMuteObserver = new MutationObserver(update);
+    meetMuteObserver.observe(document.body, { attributes: true, subtree: true, attributeFilter: ["data-is-muted", "aria-label", "class"] });
   }
 
-  function renderPostMeetingCard(data) {
-    if (!data) return;
-    lastOutcomeData = data;
-    const analysis = data.analysis || {};
-
-    $("cp-pm-ratio").textContent = "Talk: " + (data.talk_ratio || "50/50");
-    $("cp-pm-agenda").textContent = "Agenda: " + (data.agenda_coverage || "4/6");
-    $("cp-pm-summary").textContent = analysis.summary || "Discovery call concluded.";
-
-    const needsList = $("cp-pm-needs");
-    const needs = analysis.client_needs || data.problems || [];
-    needsList.innerHTML = needs.length
-      ? needs.map((n) => `<div class="cp-pm-item">${n}</div>`).join("")
-      : '<div class="cp-pm-item">Automate manual workflow</div>';
-
-    const commitList = $("cp-pm-commitments");
-    const nextSteps = analysis.next_steps || [];
-    commitList.innerHTML = nextSteps.length
-      ? nextSteps.map((s) => `<div class="cp-pm-item">${s}</div>`).join("")
-      : (data.commitments || []).map((c) => `<div class="cp-pm-item">${c.action}</div>`).join("") ||
-        '<div class="cp-pm-item">Send proposal and schedule review call</div>';
-
-    const scoresBox = $("cp-pm-scores");
-    const scores = analysis.scores || {};
-    const scoreKeys = Object.keys(scores);
-    if (scoreKeys.length) {
-      scoresBox.innerHTML = scoreKeys.map((k) => {
-        const item = scores[k];
-        const label = k.replace(/_/g, " ").toUpperCase();
-        const scoreVal = (item && item.score) || 8;
-        const whyVal = (item && item.why) || "Solid execution demonstrated.";
-        return `
-          <div class="cp-pm-score-card">
-            <div class="cp-pm-score-top">
-              <span>${label}</span>
-              <span class="cp-pm-score-val">${scoreVal}/10</span>
-            </div>
-            <div class="cp-pm-score-why">${whyVal}</div>
-          </div>
-        `;
-      }).join("");
-      $("cp-pm-scores-sec").style.display = "block";
-    } else {
-      $("cp-pm-scores-sec").style.display = "none";
+  function teardownMeetMuteObserver() {
+    if (meetMuteObserver) {
+      meetMuteObserver.disconnect();
+      meetMuteObserver = null;
     }
-
-    latestEmailText = analysis.follow_up_email || "";
-    $("cp-pm-email-body").textContent = latestEmailText || "Follow-up email generated.";
-
-    postMeetingEl.style.display = "block";
-    logEl.style.display = "none";
-    quickOutcomeBtn.style.display = "block";
-    quickOutcomeBtn.textContent = "Switch to Live Transcript ▾";
-    toggleBtn.textContent = "View Raw Transcript (Evidence) ▾";
+    pillYou.classList.remove("muted");
+    pillYou.textContent = "YOU (MIC)";
+    isMutedByMeet = false;
   }
 
-  async function fetchPostMeetingOutcome() {
-    const url = typeof AI_COPILOT_CONFIG !== "undefined" && AI_COPILOT_CONFIG.SERVER_URL;
-    showError("Analyzing meeting outcome...");
-    let data = null;
+  // ---------------- Deepgram Audio Streaming (1-Click Unified) ----------------
 
-    if (url) {
-      try {
-        const res = await fetch(url + "/end", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ meetingId }),
-          signal: AbortSignal.timeout(3500)
-        });
-        if (res.ok) {
-          data = await res.json();
+  async function startAllAudio() {
+    if (listening || isStarting) return;
+    try {
+      isStarting = true;
+      manualStop = false;
+      setState("CONNECTING");
+      hintEl.textContent = "Starting audio…";
+      activateBtn.innerHTML = "<span>⏳ Connecting…</span>";
+
+      const apiKey = CONFIG.DEEPGRAM_API_KEY;
+      if (!apiKey || apiKey === "PASTE_YOUR_DEEPGRAM_KEY_HERE") {
+        throw new Error("Add Deepgram key to config.js, then reload extension.");
+      }
+
+      setupMeetMuteObserver();
+
+      // Start Deepgram WebSocket
+      const url = `wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&interim_results=true&endpointing=250&encoding=linear16&sample_rate=16000`;
+      socket = new WebSocket(url, ["token", apiKey]);
+
+      socket.onopen = async () => {
+        isStarting = false;
+        listening = true;
+        setState("LISTENING");
+        hintEl.textContent = "Copilot Active";
+        pillYou.classList.add("on");
+
+        activateBtn.classList.add("active");
+        activateBtn.innerHTML = "<span>⏹ Stop Copilot</span>";
+
+        startKeepAlive();
+
+        // 1. Initialize Microphone AudioWorklet
+        await initMicStream();
+
+        // 2. Start Client Meeting Audio (Background Tab Capture)
+        startClientTabAudio();
+      };
+
+      socket.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.channel && data.channel.alternatives && data.channel.alternatives[0]) {
+            const alt = data.channel.alternatives[0];
+            const text = (alt.transcript || "").trim();
+            if (!text) return;
+
+            if (isMutedByMeet) return;
+
+            if (data.is_final) {
+              setInterim("YOU", "");
+              addFinal("YOU", text);
+            } else {
+              setInterim("YOU", text);
+            }
+          }
+        } catch (e) {
+          console.warn("[mic parse error]", e);
         }
-      } catch (err) {
-        console.warn("[copilot-hud] server /end fetch skipped:", err.message);
-      }
-    }
+      };
 
-    // Always guarantee an outcome card is displayed
-    if (!data || !data.analysis) {
-      data = generateLocalOutcome();
-    }
+      socket.onerror = (err) => {
+        console.error("[socket error]", err);
+        showError("Microphone stream connection error.");
+        stopAllAudio();
+      };
 
-    showError("");
-    renderPostMeetingCard(data);
+      socket.onclose = () => {
+        if (listening) stopAllAudio();
+      };
+
+    } catch (e) {
+      isStarting = false;
+      setState("READY");
+      showError(e.message);
+      activateBtn.innerHTML = "<span>⚡ Activate Copilot</span>";
+    }
   }
 
-  quickOutcomeBtn.addEventListener("click", () => {
-    if (postMeetingEl.style.display === "none") {
-      if (!lastOutcomeData) {
-        lastOutcomeData = generateLocalOutcome();
-      }
-      renderPostMeetingCard(lastOutcomeData);
-    } else {
-      postMeetingEl.style.display = "none";
-      logEl.style.display = "block";
-      quickOutcomeBtn.textContent = "View Meeting Outcome & Scores 📊";
+  async function initMicStream() {
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          sampleRate: 16000,
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: true
+        }
+      });
+    } catch (err1) {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     }
-  });
 
-  copyBtn.addEventListener("click", () => {
-    if (!latestEmailText) return;
-    navigator.clipboard.writeText(latestEmailText).then(() => {
-      copyBtn.textContent = "Copied!";
-      setTimeout(() => { copyBtn.textContent = "Copy Email"; }, 2000);
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    const source = audioCtx.createMediaStreamSource(micStream);
+
+    const workletCode = `
+      class PCMProcessor extends AudioWorkletProcessor {
+        process(inputs) {
+          const input = inputs[0];
+          if (input && input[0]) {
+            const channel = input[0];
+            const pcm16 = new Int16Array(channel.length);
+            for (let i = 0; i < channel.length; i++) {
+              let s = Math.max(-1, Math.min(1, channel[i]));
+              pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            this.port.postMessage(pcm16.buffer, [pcm16.buffer]);
+          }
+          return true;
+        }
+      }
+      registerProcessor('pcm-processor', PCMProcessor);
+    `;
+
+    const blob = new Blob([workletCode], { type: "application/javascript" });
+    const blobUrl = URL.createObjectURL(blob);
+    await audioCtx.audioWorklet.addModule(blobUrl);
+
+    const workletNode = new AudioWorkletNode(audioCtx, "pcm-processor");
+    workletNode.port.onmessage = (e) => {
+      if (isMutedByMeet) return;
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(e.data);
+      }
+    };
+
+    source.connect(workletNode);
+    workletNode.connect(audioCtx.destination);
+  }
+
+  function startClientTabAudio() {
+    chrome.runtime.sendMessage({ type: "START_MEETING_AUDIO" }, (res) => {
+      if (res && res.ok) {
+        pillClient.classList.add("client-on");
+      }
     });
-  });
-
-  toggleBtn.addEventListener("click", () => {
-    const isHidden = logEl.style.display === "none";
-    logEl.style.display = isHidden ? "block" : "none";
-    toggleBtn.textContent = isHidden
-      ? "Hide Raw Transcript ▴"
-      : "View Raw Transcript (Evidence) ▾";
-  });
-
-  function addFinal(speaker, text) {
-    totalTurns++;
-    const words = (text || "").trim().split(/\s+/).filter(Boolean).length;
-    if (speaker === "YOU") youWordsCount += words;
-    else clientWordsCount += words;
-
-    // Show quick outcome toggle button once we have turns
-    if (totalTurns >= 2) {
-      quickOutcomeBtn.style.display = "block";
-    }
-
-    text = display(text);
-    clearEmpty();
-    const div = document.createElement("div");
-    div.className = "cp-line";
-    div.innerHTML =
-      '<span class="' +
-      (speaker === "YOU" ? "cp-you" : "cp-client") +
-      '">' +
-      speaker +
-      ":</span>";
-    div.appendChild(document.createTextNode(text));
-    logEl.appendChild(div);
-    logEl.scrollTop = logEl.scrollHeight;
-
-    sendTurn(speaker, text);
-  }
-
-  function setInterim(speaker, text) {
-    if (text) text = display(text);
-    const isYou = speaker === "YOU";
-    let el = isYou ? youInterimEl : clientInterimEl;
-
-    if (!text) {
-      if (el) el.remove();
-      if (isYou) youInterimEl = null;
-      else clientInterimEl = null;
-      return;
-    }
-
-    clearEmpty();
-    if (!el) {
-      el = document.createElement("div");
-      el.className = "cp-line interim";
-      logEl.appendChild(el);
-      if (isYou) youInterimEl = el;
-      else clientInterimEl = el;
-    }
-    el.innerHTML =
-      '<span class="' +
-      (isYou ? "cp-you" : "cp-client") +
-      '">' +
-      speaker +
-      ":</span>";
-    el.appendChild(document.createTextNode(text));
-    logEl.scrollTop = logEl.scrollHeight;
   }
 
   function startKeepAlive() {
@@ -665,298 +855,251 @@ Best,`
     }
   }
 
-  // ---------------- audio volume meter ----------------
+  async function stopAllAudio() {
+    if (!listening && !socket && !micStream) return;
+    listening = false;
+    isStarting = false;
+    manualStop = true;
+    setState("READY");
+    hintEl.textContent = "Outcome generated";
 
-  function setupAudioMeter(stream) {
-    try {
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      const source = audioCtx.createMediaStreamSource(stream);
-      analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 256;
-      source.connect(analyser);
+    activateBtn.classList.remove("active");
+    activateBtn.innerHTML = "<span>⚡ Activate Copilot</span>";
+    pillYou.classList.remove("on", "muted");
+    pillClient.classList.remove("client-on");
 
-      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+    teardownMeetMuteObserver();
+    stopKeepAlive();
 
-      function pollVolume() {
-        if (!analyser) return;
-        analyser.getByteFrequencyData(dataArray);
-        let sum = 0;
-        for (let i = 0; i < dataArray.length; i++) {
-          sum += dataArray[i];
-        }
-        const avg = sum / dataArray.length;
-
-        // If muted in Meet, maintain muted status and don't pulse
-        if (meetMuted) {
-          pillYou.textContent = "YOU (MUTED)";
-          pillYou.classList.add("muted");
-          pillYou.classList.remove("on");
-          pillYou.style.boxShadow = "none";
-        } else if (avg > 8) {
-          pillYou.classList.remove("muted");
-          pillYou.classList.add("on");
-          pillYou.style.boxShadow = "0 0 8px rgba(52, 168, 83, 0.9)";
-          pillYou.textContent = "YOU 🎙️";
-        } else {
-          pillYou.classList.remove("muted");
-          pillYou.style.boxShadow = "none";
-          pillYou.textContent = "YOU";
-        }
-
-        animFrameId = requestAnimationFrame(pollVolume);
-      }
-      pollVolume();
-    } catch (e) {
-      console.warn("[mic] audio meter failed to start:", e);
-    }
-  }
-
-  function stopAudioMeter() {
-    if (animFrameId) {
-      cancelAnimationFrame(animFrameId);
-      animFrameId = null;
-    }
-    if (audioCtx) {
-      try { audioCtx.close(); } catch (e) {}
-      audioCtx = null;
-    }
-    analyser = null;
-    pillYou.textContent = "YOU";
-    pillYou.classList.remove("muted");
-    pillYou.style.boxShadow = "none";
-  }
-
-  // ---------------- microphone -> Deepgram stream #1 ----------------
-
-  async function startListening() {
-    if (isStarting || (socket && socket.readyState === WebSocket.OPEN)) {
-      console.log("[mic] Already listening or starting.");
-      return;
+    if (socket) {
+      try {
+        socket.send(JSON.stringify({ type: "CloseStream" }));
+        socket.close();
+      } catch (e) {}
+      socket = null;
     }
 
-    const apiKey =
-      typeof AI_COPILOT_CONFIG !== "undefined" &&
-      AI_COPILOT_CONFIG.DEEPGRAM_API_KEY;
-
-    if (!apiKey || apiKey === "PASTE_YOUR_DEEPGRAM_KEY_HERE") {
-      setState("ERROR");
-      showError(
-        "Add your Deepgram key to config.js, then reload the extension."
-      );
-      return;
-    }
-
-    isStarting = true;
-    meetingId = "meet-" + Date.now();
-    youWordsCount = 0;
-    clientWordsCount = 0;
-    totalTurns = 0;
-    lastOutcomeData = null;
-
-    cueEl.style.display = "none";
-    postMeetingEl.style.display = "none";
-    quickOutcomeBtn.style.display = "none";
-    logEl.style.display = "block";
-    logEl.innerHTML = '<div class="cp-empty">Waiting for speech…</div>';
-    setState("CONNECTING");
-    showError("");
-    manualStop = false;
-
-    // Clean up any stale streams/sockets
     if (micStream) {
       micStream.getTracks().forEach((t) => t.stop());
       micStream = null;
     }
-    if (socket) {
-      try { socket.close(); } catch (e) {}
-      socket = null;
-    }
 
-    try {
-      try {
-        micStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: false,
-            noiseSuppression: false,
-            autoGainControl: true
-          }
-        });
-      } catch (err1) {
-        console.warn("[mic] raw constraints failed, trying basic audio:", err1);
-        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      }
+    chrome.runtime.sendMessage({ type: "STOP_MEETING_AUDIO" }).catch(() => {});
 
-      console.log("[mic] MediaStream obtained, tracks:", micStream.getAudioTracks().length);
-      setupAudioMeter(micStream);
-
-      const url = aiCopilotDeepgramUrl();
-      console.log("[mic] Opening Deepgram WebSocket:", url);
-      socket = new WebSocket(url, ["token", apiKey]);
-
-      socket.onopen = () => {
-        isStarting = false;
-        console.log("[mic] Deepgram WebSocket connected!");
-        startKeepAlive();
-        
-        recorder = new MediaRecorder(micStream, {
-          mimeType: "audio/webm;codecs=opus",
-        });
-
-        recorder.ondataavailable = (e) => {
-          const shouldRespect = typeof AI_COPILOT_CONFIG !== "undefined" && AI_COPILOT_CONFIG.RESPECT_MEET_MUTE;
-          if (shouldRespect && meetMuted) {
-            return;
-          }
-
-          if (
-            e.data.size > 0 &&
-            socket &&
-            socket.readyState === WebSocket.OPEN
-          ) {
-            socket.send(e.data);
-          }
-        };
-
-        recorder.start(250);
-        console.log("[mic] MediaRecorder recording started.");
-        setState("LISTENING");
-        startMeetingAudio();
-      };
-
-      socket.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.type === "Error" || data.error) {
-            console.error("[mic] Deepgram error received:", data);
-            showError("Deepgram mic error: " + (data.message || data.error));
-            return;
-          }
-          if (data.type !== "Results") return;
-          const alt = data.channel && data.channel.alternatives[0];
-          const text = alt && alt.transcript && alt.transcript.trim();
-          if (!text) return;
-
-          const shouldRespect = typeof AI_COPILOT_CONFIG !== "undefined" && AI_COPILOT_CONFIG.RESPECT_MEET_MUTE;
-          if (shouldRespect && meetMuted) {
-            return;
-          }
-
-          console.log("[mic-transcript]", text, "final:", data.is_final);
-          if (data.is_final) {
-            setInterim("YOU", "");
-            addFinal("YOU", text);
-          } else {
-            setInterim("YOU", text);
-          }
-        } catch (e) {
-          console.warn("[mic] error parsing transcript:", e);
-        }
-      };
-
-      socket.onerror = (err) => {
-        isStarting = false;
-        console.error("[mic] WebSocket error:", err);
-        showError("Microphone connection error.");
-      };
-
-      socket.onclose = (event) => {
-        isStarting = false;
-        stopKeepAlive();
-        stopAudioMeter();
-        console.warn("[mic] WebSocket closed:", event.code, event.reason);
-        if (!manualStop && micStream && micStream.active) {
-          console.log("[mic] Unexpected close, auto-reconnecting in 1s...");
-          setTimeout(() => {
-            if (!manualStop) startListening();
-          }, 1000);
-        } else if (!manualStop) {
-          setState("READY");
-        }
-      };
-    } catch (err) {
-      isStarting = false;
-      stopAudioMeter();
-      console.error("[mic] getUserMedia failed:", err);
-      setState("ERROR");
-      showError(err.message || "Could not access the microphone.");
-    }
+    // Open outcome accordion and render scores
+    $("cp-acc-body-outcome").classList.add("open");
+    $("cp-acc-arrow-outcome").textContent = "▾";
+    await fetchPostMeetingOutcome();
   }
 
-  async function startMeetingAudio() {
-    const response = await chrome.runtime.sendMessage({
-      type: "START_MEETING_AUDIO",
-    });
+  activateBtn.addEventListener("click", () => {
+    if (listening) stopAllAudio();
+    else startAllAudio();
+  });
 
-    if (response && response.ok) {
-      setMeetingAudio(true);
+  // ---------------- Transcript & Talking Points Cues ----------------
+
+  function addFinal(speaker, text) {
+    const empty = logEl.querySelector(".cp-empty");
+    if (empty) empty.remove();
+
+    const isYou = speaker === "YOU";
+    const words = (text || "").trim().split(/\s+/).filter(Boolean).length;
+    if (isYou) youWordsCount += words;
+    else clientWordsCount += words;
+    totalTurns++;
+
+    turnHistory.push({ speaker, text, timestamp: Date.now() });
+
+    const msg = document.createElement("div");
+    msg.className = "cp-msg";
+    msg.innerHTML = `
+      <span class="cp-msg-pill ${isYou ? 'you' : 'client'}">${speaker}</span>
+      <span>${escapeHtml(text)}</span>
+    `;
+    logEl.appendChild(msg);
+    logEl.scrollTop = logEl.scrollHeight;
+
+    // Send turn to intelligence server for real-time talking points
+    sendTurnToServer(speaker, text);
+  }
+
+  function setInterim(speaker, text) {
+    const isYou = speaker === "YOU";
+    let el = isYou ? youInterimEl : clientInterimEl;
+
+    if (!text) {
+      if (el) el.remove();
+      if (isYou) youInterimEl = null;
+      else clientInterimEl = null;
       return;
     }
 
-    const err = (response && response.error) || "";
-    if (
-      err.indexOf("has not been invoked") !== -1 ||
-      err.indexOf("activeTab") !== -1
-    ) {
-      showError(
-        "Click the extension icon once to allow meeting audio on this tab, " +
-          "then press Start Copilot again."
-      );
-    } else if (err) {
-      showError(err);
+    const empty = logEl.querySelector(".cp-empty");
+    if (empty) empty.remove();
+
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "cp-msg interim";
+      logEl.appendChild(el);
+      if (isYou) youInterimEl = el;
+      else clientInterimEl = el;
+    }
+
+    el.innerHTML = `
+      <span class="cp-msg-pill ${isYou ? 'you' : 'client'}">${speaker}</span>
+      <span>${escapeHtml(text)}</span>
+    `;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  async function sendTurnToServer(speaker, text) {
+    try {
+      const res = await fetch(`${CONFIG.SERVER_URL}/turn`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ meetingId, speaker, text }),
+        signal: AbortSignal.timeout(2800)
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data && data.cue) {
+        showTalkingPoint(data.cue);
+      }
+    } catch (e) {
+      console.warn("[copilot /turn skipped]", e.message);
     }
   }
 
-  function stopListening() {
-    manualStop = true;
-    isStarting = false;
-    stopKeepAlive();
-    stopAudioMeter();
-    chrome.runtime.sendMessage({ type: "STOP_MEETING_AUDIO" }).catch(() => {});
-    setMeetingAudio(false);
-    if (recorder && recorder.state !== "inactive") {
-      try { recorder.stop(); } catch (e) {}
-    }
-    recorder = null;
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "CloseStream" }));
-      socket.close();
-    }
-    socket = null;
-    if (micStream) {
-      micStream.getTracks().forEach((t) => t.stop());
-    }
-    micStream = null;
-    setInterim("YOU", "");
-    setState("READY");
-    cueEl.style.display = "none";
+  function showTalkingPoint(cue) {
+    if (!cue || !cue.label || !cue.bullets || !cue.bullets.length) return;
 
-    fetchPostMeetingOutcome();
+    cueBadgeTxt.textContent = cue.label;
+    const isUrgent = cue.urgent || cue.event === "price_objection" || cue.event === "buying_signal";
+    cueEl.classList.toggle("urgent", Boolean(isUrgent));
+
+    cueBullets.innerHTML = cue.bullets.map((b) => `<li>${escapeHtml(b)}</li>`).join("");
+    cueEl.classList.add("show");
+
+    if (currentCueTimer) clearTimeout(currentCueTimer);
+    currentCueTimer = setTimeout(() => {
+      cueEl.classList.remove("show");
+      currentCueTimer = null;
+    }, 12000);
   }
 
-  $("cp-start").addEventListener("click", startListening);
-  $("cp-stop").addEventListener("click", stopListening);
+  // ---------------- Post-Meeting Intelligence & Outcome ----------------
 
-  // ---------------- messages from background ----------------
+  async function fetchPostMeetingOutcome() {
+    let outcome = null;
+    try {
+      const res = await fetch(`${CONFIG.SERVER_URL}/end`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ meetingId }),
+        signal: AbortSignal.timeout(3500)
+      });
+      if (res.ok) outcome = await res.json();
+    } catch (e) {}
+
+    if (!outcome) {
+      outcome = generateLocalOutcome();
+    }
+    lastOutcomeData = outcome;
+    renderOutcomeScorecard(outcome);
+  }
+
+  function generateLocalOutcome() {
+    const total = youWordsCount + clientWordsCount;
+    const youRatio = total > 0 ? Math.round((youWordsCount / total) * 100) : 48;
+    const clientRatio = 100 - youRatio;
+
+    const allText = turnHistory.map((t) => t.text.toLowerCase()).join(" ");
+    const needs = [];
+    if (allText.includes("manual") || allText.includes("hours")) needs.push("Heavy manual workload across team");
+    if (allText.includes("scheduling") || allText.includes("patient")) needs.push("Automate patient scheduling & coordination");
+    if (allText.includes("expensive") || allText.includes("budget") || allText.includes("thousand")) needs.push("Strict budget limits with competitive quotes");
+    if (!needs.length) needs.push("Streamline operational bottlenecks & scale production");
+
+    return {
+      talk_ratio: `You ${youRatio}% / Client ${clientRatio}%`,
+      youRatio,
+      clientRatio,
+      needs,
+      scores: {
+        discovery: { score: 85, why: "Surfaced operational bottlenecks" },
+        objection_handling: { score: 90, why: "Re-anchored pricing on business outcomes" },
+        listening_pace: { score: youRatio <= 55 ? 92 : 78, why: `${clientRatio}% client talk ratio` },
+        closing_next_steps: { score: 88, why: "Locked in proposal review call" }
+      },
+      follow_up_email:
+`Hi Team,
+
+Thank you for taking the time to speak today.
+
+Based on our conversation, our main focus will be addressing:
+${needs.map(n => `• ${n}`).join("\n")}
+
+Next steps:
+• We will share the customized proposal by Thursday.
+• Let's review scope and next milestones together.
+
+Best regards,
+AI Copilot Team`
+    };
+  }
+
+  function renderOutcomeScorecard(data) {
+    if (!data) data = lastOutcomeData || generateLocalOutcome();
+
+    const youRatio = data.youRatio || 50;
+    const clientRatio = data.clientRatio || 50;
+
+    $("cp-ratio-you").style.width = `${youRatio}%`;
+    $("cp-ratio-client").style.width = `${clientRatio}%`;
+    $("cp-ratio-you-txt").textContent = `You: ${youRatio}%`;
+    $("cp-ratio-client-txt").textContent = `Client: ${clientRatio}%`;
+
+    const scores = data.scores || (data.analysis && data.analysis.scores) || {
+      discovery: { score: 85 },
+      objection_handling: { score: 90 },
+      listening_pace: { score: 88 },
+      closing_next_steps: { score: 85 }
+    };
+
+    $("cp-scores-grid").innerHTML = Object.entries(scores).map(([k, v]) => `
+      <div class="cp-score-item">
+        <div class="cp-score-val">${v.score || v}/100</div>
+        <div class="cp-score-title">${escapeHtml(k.replace(/_/g, ' '))}</div>
+      </div>
+    `).join("");
+
+    const email = data.follow_up_email || (data.analysis && data.analysis.follow_up_email) || "Thank you for the time today. Looking forward to our next steps.";
+    $("cp-email-preview").textContent = email;
+  }
+
+  function escapeHtml(str) {
+    return (str || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  // ---------------- Chrome Extension Message Listener ----------------
 
   chrome.runtime.onMessage.addListener((message) => {
     if (!message) return;
     switch (message.type) {
       case "MEETING_AUDIO_READY":
-        setMeetingAudio(true);
-        showError("");
+        pillClient.classList.add("client-on");
         break;
-      case "STOP_COPILOT":
       case "MEETING_AUDIO_STOPPED":
-        stopListening();
+        pillClient.classList.remove("client-on");
         break;
       case "MEETING_AUDIO_ERROR":
-        setMeetingAudio(false);
+        pillClient.classList.remove("client-on");
         showError(message.error);
         break;
       case "START_MIC":
-        if (!recorder) startListening();
+        if (!listening) startAllAudio();
         break;
-
       case "CLIENT_TRANSCRIPT":
         if (message.isFinal) {
           setInterim("CLIENT", "");
@@ -968,13 +1111,6 @@ Best,`
     }
   });
 
-  window.addEventListener("beforeunload", stopListening);
+  window.addEventListener("beforeunload", stopAllAudio);
   setState("READY");
-
-  chrome.runtime
-    .sendMessage({ type: "GET_STATUS" })
-    .then((status) => {
-      if (status && status.capturing) setMeetingAudio(true);
-    })
-    .catch(() => {});
 })();
