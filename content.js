@@ -4,6 +4,8 @@
  * Features:
  *  - Fully draggable anywhere on screen by the header bar
  *  - Two dedicated control buttons: [ 🎙️ My Audio ] and [ 🔊 Meeting Audio ]
+ *  - 1-click shortcut: Alt+Shift+M toggles Meeting Audio instantly
+ *  - Anti-freeze protection: 3.5s timeout prevents stuck "WAIT..." state
  *  - Dropdown menu style with collapsible sections for minimal footprint
  *  - Dual-channel real-time transcription (YOU mic + CLIENT tab audio)
  *  - Google Meet Mute sync (pauses mic and toggles [ 🎙️ My Audio: MUTED ])
@@ -28,6 +30,7 @@
   let meetingId = "meet-" + Date.now();
   let isMyAudioLive = false;
   let isMeetingAudioLive = false;
+  let meetingAudioTimeout = null;
 
   let micStream = null;
   let socket = null;
@@ -163,11 +166,10 @@
 
       /* Dual Audio Action Bar */
       .cp-audio-bar {
-        padding: 8px 12px;
+        padding: 8px 12px 4px 12px;
         display: flex;
         gap: 8px;
         background: rgba(0, 0, 0, 0.25);
-        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
       }
       .cp-audio-btn {
         flex: 1;
@@ -248,6 +250,16 @@
       .cp-audio-btn.connecting .cp-btn-badge {
         background: #fbbc04;
         color: #202124;
+      }
+
+      .cp-hint-subbar {
+        padding: 0 14px 6px 14px;
+        display: flex;
+        justify-content: space-between;
+        font-size: 10px;
+        color: #9aa0a6;
+        background: rgba(0, 0, 0, 0.25);
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
       }
 
       /* Body Sections */
@@ -417,6 +429,7 @@
         border-radius: 6px;
         display: none;
         margin-top: 8px;
+        line-height: 1.4;
       }
     </style>
 
@@ -450,13 +463,19 @@
         <span class="cp-btn-badge" id="cp-badge-my-audio">START</span>
       </button>
 
-      <button class="cp-audio-btn" id="cp-btn-meeting-audio" title="Start/Stop meeting audio capture">
+      <button class="cp-audio-btn" id="cp-btn-meeting-audio" title="Click or press Alt+Shift+M to capture meeting audio">
         <div class="cp-btn-left">
           <span class="cp-btn-icon">🔊</span>
           <span class="cp-btn-name">Meeting Audio</span>
         </div>
         <span class="cp-btn-badge" id="cp-badge-meeting-audio">START</span>
       </button>
+    </div>
+
+    <!-- Subbar Helper Hints -->
+    <div class="cp-hint-subbar" id="cp-hint-subbar">
+      <span>🎙️ 1-click in Meet</span>
+      <span>🔊 Press <strong style="color:#8ab4f8;">Alt+Shift+M</strong></span>
     </div>
 
     <!-- Main Body Sections -->
@@ -582,6 +601,7 @@
     hud.classList.toggle("minimized", isMinimized);
     $("cp-body").style.display = isMinimized ? "none" : "flex";
     $("cp-audio-bar").style.display = isMinimized ? "none" : "flex";
+    $("cp-hint-subbar").style.display = isMinimized ? "none" : "flex";
     $("cp-min-btn").textContent = isMinimized ? "+" : "—";
   });
 
@@ -640,7 +660,7 @@
     }
     errEl.textContent = msg;
     errEl.style.display = "block";
-    setTimeout(() => { errEl.style.display = "none"; }, 6000);
+    setTimeout(() => { errEl.style.display = "none"; }, 8000);
   }
 
   function setState(state) {
@@ -911,7 +931,7 @@
     }
   }
 
-  // ---------------- [🔊 Meeting Audio] Controls & Background Bridge ----------------
+  // ---------------- [🔊 Meeting Audio] Controls & Anti-Freeze ----------------
 
   function startMeetingAudio() {
     if (isMeetingAudioLive) return;
@@ -919,15 +939,28 @@
     btnMeetingAudio.classList.add("connecting");
     setState("CONNECTING");
 
-    chrome.runtime.sendMessage({ type: "REQUEST_MEETING_AUDIO" }, (res) => {
-      if (chrome.runtime.lastError) {
+    // Anti-freeze safety timeout: never stay stuck on WAIT...
+    if (meetingAudioTimeout) clearTimeout(meetingAudioTimeout);
+    meetingAudioTimeout = setTimeout(() => {
+      if (!isMeetingAudioLive) {
         btnMeetingAudio.classList.remove("connecting");
         badgeMeetingAudio.textContent = "START";
-        showError(chrome.runtime.lastError.message);
+        updateOverallState();
+        showError("Press Alt+Shift+M or click toolbar icon to allow tab audio.");
+      }
+    }, 3500);
+
+    chrome.runtime.sendMessage({ type: "REQUEST_MEETING_AUDIO" }, (res) => {
+      if (chrome.runtime.lastError) {
+        if (meetingAudioTimeout) clearTimeout(meetingAudioTimeout);
+        btnMeetingAudio.classList.remove("connecting");
+        badgeMeetingAudio.textContent = "START";
+        showError("Press Alt+Shift+M or click toolbar icon to allow tab audio.");
         updateOverallState();
         return;
       }
       if (res && res.error) {
+        if (meetingAudioTimeout) clearTimeout(meetingAudioTimeout);
         btnMeetingAudio.classList.remove("connecting");
         badgeMeetingAudio.textContent = "START";
         showError(res.error);
@@ -937,6 +970,7 @@
   }
 
   function stopMeetingAudio() {
+    if (meetingAudioTimeout) clearTimeout(meetingAudioTimeout);
     chrome.runtime.sendMessage({ type: "STOP_MEETING_AUDIO" }).catch(() => {});
     isMeetingAudioLive = false;
     btnMeetingAudio.classList.remove("client-live", "connecting");
@@ -1147,6 +1181,7 @@ AI Copilot Team`
     if (!message) return;
     switch (message.type) {
       case "MEETING_AUDIO_READY":
+        if (meetingAudioTimeout) clearTimeout(meetingAudioTimeout);
         isMeetingAudioLive = true;
         btnMeetingAudio.classList.remove("connecting");
         btnMeetingAudio.classList.add("client-live");
@@ -1155,6 +1190,7 @@ AI Copilot Team`
         break;
 
       case "MEETING_AUDIO_STOPPED":
+        if (meetingAudioTimeout) clearTimeout(meetingAudioTimeout);
         isMeetingAudioLive = false;
         btnMeetingAudio.classList.remove("client-live", "connecting");
         badgeMeetingAudio.textContent = "START";
@@ -1163,11 +1199,12 @@ AI Copilot Team`
         break;
 
       case "MEETING_AUDIO_ERROR":
+        if (meetingAudioTimeout) clearTimeout(meetingAudioTimeout);
         isMeetingAudioLive = false;
         btnMeetingAudio.classList.remove("client-live", "connecting");
         badgeMeetingAudio.textContent = "START";
         updateOverallState();
-        showError(message.error);
+        showError(message.error || "Press Alt+Shift+M or click toolbar icon to allow tab audio.");
         break;
 
       case "START_MIC":
@@ -1186,6 +1223,7 @@ AI Copilot Team`
   });
 
   window.addEventListener("beforeunload", () => {
+    if (meetingAudioTimeout) clearTimeout(meetingAudioTimeout);
     stopMyAudio();
     stopMeetingAudio();
   });

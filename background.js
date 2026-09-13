@@ -53,14 +53,11 @@ function toContent(message) {
 // ---------------- start / stop ----------------
 
 async function startTabCapture(tabId) {
-  // Already capturing this tab. Don't try again - Chrome rejects a second
-  // capture on the same tab, and the user would see a false error.
   if (capturing && activeTabId === tabId) {
     toContent({ type: "MEETING_AUDIO_READY" });
     return;
   }
 
-  // Capturing a different tab: tear the old one down first.
   if (capturing) await stopTabCapture();
 
   activeTabId = tabId;
@@ -68,13 +65,21 @@ async function startTabCapture(tabId) {
   await ensureOffscreen();
 
   const streamId = await new Promise((resolve, reject) => {
-    chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (id) => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-        return;
-      }
-      resolve(id);
-    });
+    try {
+      chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (id) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        if (!id) {
+          reject(new Error("No stream ID returned by tabCapture."));
+          return;
+        }
+        resolve(id);
+      });
+    } catch (e) {
+      reject(e);
+    }
   });
 
   chrome.runtime.sendMessage({
@@ -90,6 +95,27 @@ async function stopTabCapture() {
   await closeOffscreen();
   toContent({ type: "MEETING_AUDIO_STOPPED" });
   activeTabId = null;
+}
+
+// ---------------- keyboard shortcut (Alt+Shift+M) ----------------
+
+if (chrome.commands && chrome.commands.onCommand) {
+  chrome.commands.onCommand.addListener(async (command) => {
+    if (command === "toggle-meeting-audio") {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab || !tab.id) return;
+      if (capturing && activeTabId === tab.id) {
+        await stopTabCapture();
+      } else {
+        try {
+          await startTabCapture(tab.id);
+        } catch (err) {
+          console.error("[copilot] shortcut capture failed:", err);
+          toContent({ type: "MEETING_AUDIO_ERROR", error: err.message });
+        }
+      }
+    }
+  });
 }
 
 // ---------------- router ----------------
@@ -126,7 +152,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       startTabCapture(tabId)
         .then(() => sendResponse({ ok: true }))
         .catch(async (err) => {
-          console.warn("[copilot] meeting audio direct start failed, trying popup bridge:", err.message);
+          console.warn("[copilot] direct tab capture failed:", err.message);
           try {
             await chrome.storage.local.set({ autoStartTabAudio: true, targetTabId: tabId });
             if (chrome.action && chrome.action.openPopup) {
@@ -135,14 +161,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             } else {
               sendResponse({
                 ok: false,
-                error: "Click extension icon in toolbar once to enable tab audio."
+                error: "Press Alt+Shift+M or click toolbar icon to allow tab audio."
               });
             }
           } catch (popupErr) {
-            console.error("[copilot] openPopup failed:", popupErr.message);
             sendResponse({
               ok: false,
-              error: "Click extension icon in toolbar once to permit tab audio."
+              error: "Press Alt+Shift+M or click toolbar icon to allow tab audio."
             });
           }
         });

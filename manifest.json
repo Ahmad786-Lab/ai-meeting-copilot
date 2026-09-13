@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI Meeting Copilot",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Real-time dual-channel transcription for Google Meet.",
   "permissions": ["activeTab", "tabCapture", "offscreen", "storage", "tabs"],
   "host_permissions": [
@@ -14,6 +14,15 @@
   "action": {
     "default_popup": "popup.html",
     "default_title": "AI Meeting Copilot"
+  },
+  "commands": {
+    "toggle-meeting-audio": {
+      "suggested_key": {
+        "default": "Alt+Shift+M",
+        "mac": "Alt+Shift+M"
+      },
+      "description": "Toggle Meeting Audio Capture"
+    }
   },
   "content_scripts": [
     {
