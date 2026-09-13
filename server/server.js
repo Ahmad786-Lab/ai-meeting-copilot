@@ -2,8 +2,8 @@
  * server.js — the Meeting Intelligence Layer.
  *
  *   Chrome extension  ->  POST /turn   ->  4 agents in parallel
- *                                      ->  Director + RocketRide Orchestration
- *                     <-  cue          <-  (with Modiqo Rote, Cognee ECL & HydraDB Graph)
+ *                                      ->  Director (priority & cooldown)
+ *                     <-  cue          <-  (or null if suppressed)
  *
  * Every meeting gets its own isolated store. Nothing is shared between
  * meetings, which is what lets many agents hammer it concurrently
@@ -16,7 +16,6 @@ import { getMeeting, addTurn, applyDiff, missingSlots, talkRatio, resetMeeting, 
 import { processTurn } from "./agents.js";
 import { llmText, llmAvailable } from "./llm.js";
 import { KNOWLEDGE } from "./knowledge.js";
-import { cognee, hydra, hotdata, modiqoRote, rocketRide } from "./sponsors.js";
 
 const PORT = process.env.PORT || 3000;
 const HOST = "0.0.0.0";
@@ -71,58 +70,12 @@ const server = http.createServer(async (req, res) => {
   const pathname = url.pathname;
 
   try {
-    // GET /health — surfaces all 5 sponsor engine statuses
+    // GET /health — lightweight liveness probe
     if (req.method === "GET" && pathname === "/health") {
       return sendJson(res, 200, {
         ok: true,
         llm: llmAvailable ? "connected" : "rules-only (no ANTHROPIC_API_KEY)",
-        knowledge_items: KNOWLEDGE.length,
-        sponsors: {
-          cognee: { status: "active", memory_units: cognee.memoryUnits.length },
-          hydradb: { status: "active", nodes: hydra.nodes.size, edges: hydra.edges.length, cypher: "ready" },
-          hotdata: { status: "active", latency: "0.2ms", engine: "SQL/Analytics" },
-          modiqo_rote: { status: "active", muscle_memory_playbooks: modiqoRote.playbooks.size, tokens_saved: modiqoRote.tokensSaved },
-          rocketride: { status: "active", orchestrations: rocketRide.dispatchedActions.length },
-          snyk: { status: "verified", vulnerabilities: 0 }
-        }
-      });
-    }
-
-    // GET /sponsors — full inspection endpoint for hackathon judges
-    if (req.method === "GET" && pathname === "/sponsors") {
-      const cypherTest = hydra.cypher("MATCH (c:Client)-[:HAS_OBJECTION]->(o:Objection) RETURN o");
-      const hotdataTest = hotdata.sql("SELECT talk_ratio, risk_signal FROM live_call_telemetry");
-
-      return sendJson(res, 200, {
-        hackathon: "Data & AI Hackathon: From Memory to Muscle Memory",
-        venue: "AWS Builder Loft SF",
-        stack: {
-          cognee: {
-            role: "Memory Construction Layer",
-            cognified_units: cognee.memoryUnits.length,
-            extracted_entities: cognee.extractedEntities
-          },
-          hydradb: {
-            role: "Memory Storage & Serving Layer",
-            total_nodes: hydra.nodes.size,
-            total_relationships: hydra.edges.length,
-            sample_cypher_query: cypherTest
-          },
-          hotdata: {
-            role: "Live Query & Analytics Layer",
-            sample_sql_telemetry: hotdataTest
-          },
-          modiqo_rote: {
-            role: "Muscle-Memory / Reliability Layer",
-            replays: modiqoRote.replayCount,
-            tokens_saved: modiqoRote.tokensSaved,
-            playbooks: Array.from(modiqoRote.playbooks.keys())
-          },
-          rocketride: {
-            role: "Motion / Orchestration Layer",
-            dispatched_actions: rocketRide.dispatchedActions
-          }
-        }
+        knowledge_items: KNOWLEDGE.length
       });
     }
 
@@ -165,15 +118,12 @@ const server = http.createServer(async (req, res) => {
           }
         }
 
-        // Pass candidate cue through RocketRide Orchestration + Modiqo Rote + Cognee + HydraDB
-        const orchestration = await rocketRide.orchestrateTurn(meetingId, speaker, text, result.cue);
-        const finalCue = orchestration.cue;
+        const finalCue = result.cue;
 
         console.log(
           `[turn ${turnIndex}] ${speaker}: ${text.slice(0, 50)}... ` +
           `events=${result.events.map((e) => e.event).join(",") || "-"} ` +
           `cue=${finalCue ? finalCue.label : "-"} ` +
-          `[sponsor: ${orchestration.sponsor_telemetry.rote_status}] ` +
           `${result.latency_ms}ms`
         );
 
@@ -181,8 +131,7 @@ const server = http.createServer(async (req, res) => {
           cue: finalCue,
           agenda: agendaView(meeting),
           commitments: meeting.commitments,
-          latency_ms: result.latency_ms,
-          sponsors: orchestration.sponsor_telemetry
+          latency_ms: result.latency_ms
         });
       } catch (err) {
         console.error("[turn] failed:", err);
@@ -271,16 +220,12 @@ const server = http.createServer(async (req, res) => {
         parsed = fallbackAnalysis(base, meeting);
       }
 
-      // Execute RocketRide Post-call Action (CRM sync + Follow-up motion)
-      const motionResult = await rocketRide.executePostCallMotion(meetingId, { base, analysis: parsed });
-
-      console.log(`[end] meeting concluded: ${meetingId} | Motion executed via RocketRide: ${motionResult.status}`);
+      console.log(`[end] meeting concluded: ${meetingId}`);
 
       return sendJson(res, 200, {
         ...base,
         analysis: parsed,
-        transcript,
-        rocketride_motion: motionResult
+        transcript
       });
     }
 
@@ -333,8 +278,7 @@ Best,`;
 server.listen(PORT, HOST, () => {
   console.log(`\n  Copilot server on http://localhost:${PORT}`);
   console.log(`  LLM: ${llmAvailable ? "connected" : "RULES ONLY - set ANTHROPIC_API_KEY"}`);
-  console.log(`  Knowledge items: ${KNOWLEDGE.length}`);
-  console.log(`  Mandated Hackathon Stack: Cognee + HydraDB + hotdata.dev + Modiqo Rote + RocketRide active!\n`);
+  console.log(`  Knowledge items: ${KNOWLEDGE.length}\n`);
 });
 
 server.on("error", (err) => {

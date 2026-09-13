@@ -1,15 +1,6 @@
-# AI Meeting Copilot — Sales Deal Memory Agent
+# AI Meeting Copilot
 
-> **Built for the Data and AI Hackathon: From Memory to Muscle Memory**  
-> *AWS Builder Loft, San Francisco*
-
-Real-time AI Meeting Copilot Chrome Extension for Google Meet powered by a 5-layer compound agent loop:
-- 🧩 **Cognee.ai**: Memory Construction Layer (Extracts entities & relationships via ECL pipeline)
-- 🗄️ **HydraDB**: Memory Storage & Serving Layer (OpenCypher deal graph database)
-- ⚡ **hotdata.dev**: Live Query & Analytics Layer (Sub-millisecond SQL telemetry over call turns)
-- 🚀 **RocketRide.ai**: Motion & Orchestration Layer (Live battle card dispatch & post-call CRM sync)
-- 🔁 **Modiqo.ai (Rote)**: Muscle Memory Layer (Deterministic 0-token objection playbooks)
-- 🛡️ **Snyk**: 0 security vulnerabilities
+Real-time AI Meeting Copilot Chrome Extension for Google Meet with dual-channel transcription and an on-screen intelligence HUD.
 
 ---
 

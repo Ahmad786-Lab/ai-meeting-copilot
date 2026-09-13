@@ -1,12 +1,9 @@
 /**
  * knowledge.js — company knowledge retrieval.
  *
- * Local keyword matching works out of the box so the demo never depends
- * on a network call. COGNEE_URL swaps in the real memory engine when
- * you have it running, with the local path as automatic fallback.
+ * Local keyword matching works out of the box so the meeting copilot
+ * surfaces relevant case studies, pricing, and FAQ bullets in under 1ms.
  */
-
-const COGNEE_URL = process.env.COGNEE_URL;
 
 /**
  * Edit this. These are the case studies, pricing facts and FAQ answers
@@ -57,31 +54,6 @@ export const KNOWLEDGE = [
   }
 ];
 
-async function retrieveFromCognee(text) {
-  if (!COGNEE_URL) return null;
-  try {
-    const res = await fetch(`${COGNEE_URL}/search`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ query: text, top_k: 1 })
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const hit = (data.results || data.hits || [])[0];
-    if (!hit) return null;
-    return {
-      label: "RELEVANT CONTEXT",
-      bullets: String(hit.text || hit.content || "")
-        .split("\n")
-        .filter(Boolean)
-        .slice(0, 2)
-    };
-  } catch (err) {
-    console.warn("[cognee]", err.message);
-    return null;
-  }
-}
-
 function retrieveLocal(text) {
   const lower = text.toLowerCase();
   let best = null;
@@ -100,12 +72,9 @@ function retrieveLocal(text) {
 }
 
 export async function retrieveKnowledge(text) {
-  // Only retrieve when the client is actually asking something.
+  // Only retrieve when the speaker is actually asking something.
   const asking = /\?|\b(have you|do you|can you|what about|how much|how long|how many)\b/i.test(text);
   if (!asking) return null;
-
-  const remote = await retrieveFromCognee(text);
-  if (remote) return remote;
 
   return retrieveLocal(text);
 }

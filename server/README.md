@@ -81,13 +81,3 @@ words — they have to be readable at a glance.
 
 `agents.js` holds the detection patterns and the fallback bullets. The
 fallbacks are what render when the model is slow, so make them good.
-
-## Sponsor integration points
-
-- **Cognee** — set `COGNEE_URL`. `knowledge.js` calls it first and falls
-  back to local matching if it's unreachable, so the demo can't break.
-- **Hotdata** — `state.js` is the seam. Swap the in-memory `Map` for a
-  per-meeting Hotdata database; the interface is already meeting-scoped.
-- **RocketRide** — wrap the `processTurn` fan-out in `agents.js` as a
-  pipeline. Every completed turn is one invocation, so a five-minute demo
-  call generates 40+.
