@@ -1,17 +1,18 @@
 /**
  * content.js — Real-Time AI Sales Meeting Copilot for Google Meet
  *
- * Enterprise Capabilities (Phase 1 & Phase 2):
- *  - Privacy Consent Verification (GDPR/wiretapping modal on first use)
- *  - Backend-managed Deepgram STT (Zero client-side API keys)
- *  - Single-Stream Audio Pipeline with Speaker Diarization (speaker 0 = YOU, speaker 1 = CLIENT)
- *  - Persistent, User-Dismissible Cue Cards with Priority Badges (🔴 URGENT, 🟡 CONTEXTUAL, 🟢 FYI)
+ * Enterprise Capabilities:
+ *  - Dual Dedicated Audio Controls in HUD:
+ *      * 🎤 My Audio: captures Rep microphone via 16kHz PCM
+ *      * 🔊 Client Audio: captures Google Meet tab audio via background offscreen bridge
+ *  - Backend-managed Deepgram STT (Zero client-side API keys, dual role routing)
  *  - Dynamic Objection Playbooks (Rules Engine 2.0 with custom triggers)
+ *  - Persistent, User-Dismissible Cue Cards with Priority Badges (🔴 URGENT, 🟡 CONTEXTUAL, 🟢 FYI)
  *  - Telemetry & Analytics Tracking (cue display/dismissal, call stats)
  *  - Salesforce CRM Integration (OAuth handshake & 1-click Activity Task Sync)
  *  - Streamlined Call Summary & Notes
  *  - Fully draggable and collapsible dark-themed HUD
- *  - Google Meet Mute Sync (MutationObserver on mic button)
+ *  - Google Meet Native Mute Sync (MutationObserver on mic button)
  */
 
 (() => {
@@ -26,8 +27,9 @@
   };
 
   let meetingId = "meet-" + Date.now();
-  let isCopilotLive = false;
-  let isStarting = false;
+  let isMyAudioLive = false;
+  let isClientAudioLive = false;
+  let isStartingMyAudio = false;
 
   let micStream = null;
   let audioContext = null;
@@ -56,7 +58,7 @@
         position: fixed;
         top: 20px;
         right: 20px;
-        width: 370px;
+        width: 375px;
         max-height: 90vh;
         background: rgba(18, 20, 26, 0.96);
         backdrop-filter: blur(14px);
@@ -185,17 +187,17 @@
         color: #ffffff;
       }
 
-      /* Single Action Button Header */
+      /* Action Bar: Dual Action Buttons */
       .cp-action-bar {
-        padding: 10px 14px 6px 14px;
+        padding: 8px 14px 4px 14px;
         display: flex;
         gap: 8px;
       }
-      .cp-main-btn {
+      .cp-audio-btn {
         flex: 1;
-        padding: 9px 12px;
-        background: #1a73e8;
-        border: none;
+        padding: 8px 10px;
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.12);
         border-radius: 8px;
         color: #ffffff;
         font-weight: 600;
@@ -203,22 +205,68 @@
         cursor: pointer;
         display: flex;
         align-items: center;
-        justify-content: center;
+        justify-content: space-between;
         gap: 6px;
-        box-shadow: 0 2px 6px rgba(26, 115, 232, 0.35);
-        transition: background 0.15s, transform 0.1s;
+        box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+        transition: background 0.15s, border-color 0.15s, transform 0.1s;
       }
-      .cp-main-btn:hover { background: #1557b0; }
-      .cp-main-btn:active { transform: scale(0.98); }
-      .cp-main-btn.active {
-        background: #d93025;
-        box-shadow: 0 2px 6px rgba(217, 48, 37, 0.35);
+      .cp-audio-btn:hover {
+        background: rgba(255, 255, 255, 0.1);
+        border-color: rgba(255, 255, 255, 0.2);
       }
-      .cp-main-btn.active:hover { background: #b3261e; }
+      .cp-audio-btn:active { transform: scale(0.98); }
+      .cp-audio-btn.live {
+        background: rgba(46, 204, 113, 0.18);
+        border-color: #2ecc71;
+        box-shadow: 0 0 10px rgba(46, 204, 113, 0.25);
+      }
+      .cp-audio-btn.client-live {
+        background: rgba(52, 152, 219, 0.2);
+        border-color: #3498db;
+        box-shadow: 0 0 10px rgba(52, 152, 219, 0.25);
+      }
+      .cp-audio-btn.connecting {
+        background: rgba(241, 196, 15, 0.18);
+        border-color: #f1c40f;
+      }
+      .cp-audio-btn.muted {
+        background: rgba(255, 82, 82, 0.18);
+        border-color: #ff5252;
+      }
+      .cp-btn-left {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .cp-audio-badge {
+        font-size: 9px;
+        padding: 2px 5px;
+        border-radius: 6px;
+        background: rgba(255, 255, 255, 0.1);
+        color: #9aa0a6;
+        font-weight: 700;
+        letter-spacing: 0.3px;
+      }
+      .cp-audio-btn.live .cp-audio-badge {
+        background: #2ecc71;
+        color: #0b1a10;
+      }
+      .cp-audio-btn.client-live .cp-audio-badge {
+        background: #3498db;
+        color: #ffffff;
+      }
+      .cp-audio-btn.muted .cp-audio-badge {
+        background: #ff5252;
+        color: #ffffff;
+      }
+      .cp-audio-btn.connecting .cp-audio-badge {
+        background: #f1c40f;
+        color: #000000;
+      }
 
       /* Body Containers */
       .cp-body {
-        padding: 8px 14px 14px 14px;
+        padding: 6px 14px 14px 14px;
         overflow-y: auto;
         display: flex;
         flex-direction: column;
@@ -539,15 +587,28 @@
 
     <!-- Quick Dropdown Menu -->
     <div class="cp-menu-dropdown" id="cp-menu-dropdown">
+      <div class="cp-menu-item" id="cp-menu-start-both">⚡ Start Both Audio Streams</div>
       <div class="cp-menu-item" id="cp-menu-summary">📊 View Call Summary</div>
       <div class="cp-menu-item" id="cp-menu-toggle-transcript">📝 Toggle Transcript View</div>
       <div class="cp-menu-item" id="cp-menu-reset">🔄 Reset Current Meeting</div>
     </div>
 
-    <!-- Action Bar: Single-Stream Start/Stop -->
+    <!-- Action Bar: Two Dedicated Buttons (My Audio + Client Audio) -->
     <div class="cp-action-bar" id="cp-action-bar">
-      <button class="cp-main-btn" id="cp-main-btn">
-        <span>⚡ Start Copilot</span>
+      <button class="cp-audio-btn" id="cp-btn-my-audio" title="Start/Stop Your Microphone Audio">
+        <span class="cp-btn-left">
+          <span class="cp-btn-icon">🎤</span>
+          <span>My Audio</span>
+        </span>
+        <span class="cp-audio-badge" id="cp-badge-my-audio">OFF</span>
+      </button>
+
+      <button class="cp-audio-btn" id="cp-btn-client-audio" title="Directly Capture Google Meet Client Audio">
+        <span class="cp-btn-left">
+          <span class="cp-btn-icon">🔊</span>
+          <span>Client Audio</span>
+        </span>
+        <span class="cp-audio-badge" id="cp-badge-client-audio">OFF</span>
       </button>
     </div>
 
@@ -624,8 +685,12 @@
   const dragHandle = $("cp-drag-handle");
   const dotEl = $("cp-dot");
   const stateEl = $("cp-state");
-  const mainBtn = $("cp-main-btn");
   const muteIndicator = $("cp-mute-indicator");
+
+  const btnMyAudio = $("cp-btn-my-audio");
+  const badgeMyAudio = $("cp-badge-my-audio");
+  const btnClientAudio = $("cp-btn-client-audio");
+  const badgeClientAudio = $("cp-badge-client-audio");
 
   const cueEl = $("cp-cue");
   const cueBadge = $("cp-cue-badge");
@@ -716,6 +781,11 @@
   });
 
   // Menu items
+  $("cp-menu-start-both").addEventListener("click", () => {
+    if (!isMyAudioLive) startMyAudio();
+    if (!isClientAudioLive) startClientAudio();
+  });
+
   $("cp-menu-summary").addEventListener("click", () => {
     $("cp-acc-body-summary").classList.add("open");
     $("cp-acc-arrow-summary").textContent = "▾";
@@ -850,11 +920,17 @@
     setTimeout(() => { errEl.style.display = "none"; }, 8000);
   }
 
-  function setState(state) {
-    stateEl.textContent = state;
-    dotEl.className = "cp-dot";
-    if (state === "LISTENING") dotEl.classList.add("live");
-    if (state === "CONNECTING") dotEl.classList.add("connecting");
+  function updateOverallState() {
+    if (isMyAudioLive || isClientAudioLive) {
+      stateEl.textContent = "LISTENING";
+      dotEl.className = "cp-dot live";
+    } else if (isStartingMyAudio) {
+      stateEl.textContent = "CONNECTING";
+      dotEl.className = "cp-dot connecting";
+    } else {
+      stateEl.textContent = "READY";
+      dotEl.className = "cp-dot";
+    }
   }
 
   function resetMeetingState() {
@@ -898,6 +974,15 @@
       if (muted !== isMutedByMeet) {
         isMutedByMeet = muted;
         muteIndicator.classList.toggle("show", isMutedByMeet);
+        if (isMyAudioLive) {
+          if (isMutedByMeet) {
+            btnMyAudio.className = "cp-audio-btn muted";
+            badgeMyAudio.textContent = "MUTED";
+          } else {
+            btnMyAudio.className = "cp-audio-btn live";
+            badgeMyAudio.textContent = "LIVE";
+          }
+        }
       }
     };
     update();
@@ -914,86 +999,92 @@
     isMutedByMeet = false;
   }
 
-  // ---------------- Single-Stream Audio Pipeline with Diarization ----------------
+  // ---------------- 1. My Audio (Rep Microphone) ----------------
 
-  async function startCopilot() {
-    if (isCopilotLive || isStarting) return;
+  async function startMyAudio() {
+    if (isMyAudioLive || isStartingMyAudio) return;
 
-    // Check Privacy Consent first
     if (window.CopilotConsent) {
       const consented = await window.CopilotConsent.ensureConsent();
       if (!consented) {
-        showError("Audio capture declined. Enable consent to activate copilot.");
+        showError("Audio consent required to activate copilot.");
         return;
       }
     }
 
     try {
-      isStarting = true;
-      setState("CONNECTING");
-      mainBtn.innerHTML = "<span>⏳ Connecting…</span>";
+      isStartingMyAudio = true;
+      btnMyAudio.className = "cp-audio-btn connecting";
+      badgeMyAudio.textContent = "CONNECTING…";
+      updateOverallState();
 
       setupMeetMuteObserver();
 
-      // Open WebSocket to Backend Server
-      const wsUrl = CONFIG.SERVER_WS_URL || "ws://localhost:3000/transcribe";
+      // Connect to backend STT with role=rep
+      const wsUrl = (CONFIG.SERVER_WS_URL || "ws://localhost:3000/transcribe") + "?role=rep";
       socket = new WebSocket(wsUrl);
 
       socket.onopen = async () => {
-        isStarting = false;
-        isCopilotLive = true;
-        setState("LISTENING");
-        mainBtn.classList.add("active");
-        mainBtn.innerHTML = "<span>⏹ Stop Copilot</span>";
+        isStartingMyAudio = false;
+        isMyAudioLive = true;
+        btnMyAudio.className = isMutedByMeet ? "cp-audio-btn muted" : "cp-audio-btn live";
+        badgeMyAudio.textContent = isMutedByMeet ? "MUTED" : "LIVE";
+        updateOverallState();
 
         if (window.CopilotAnalytics) {
           window.CopilotAnalytics.trackEvent("call_started", { meetingId });
         }
 
-        await initAudioStream();
+        await initMicAudioStream();
+
+        // Auto-attempt client audio if not already running
+        if (!isClientAudioLive) {
+          startClientAudio();
+        }
       };
 
       socket.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
           if (data.type === "Results") {
-            const speakerName = (data.speaker === 0) ? "YOU" : "CLIENT";
             const text = (data.text || "").trim();
             if (!text) return;
 
-            if (data.speaker === 0 && isMutedByMeet) return;
+            if (isMutedByMeet) return;
 
             if (data.is_final) {
-              setInterim(speakerName, "");
-              addFinal(speakerName, text);
+              setInterim("YOU", "");
+              addFinal("YOU", text);
             } else {
-              setInterim(speakerName, text);
+              setInterim("YOU", text);
             }
           }
         } catch (e) {
-          console.warn("[transcribe parse error]", e);
+          console.warn("[transcribe rep parse error]", e);
         }
       };
 
       socket.onerror = (err) => {
-        console.error("[socket error]", err);
-        showError("Transcription WebSocket connection failed.");
+        console.error("[rep socket error]", err);
+        showError("Rep microphone transcribe connection failed.");
       };
 
       socket.onclose = () => {
-        if (isCopilotLive) {
-          stopCopilot();
+        if (isMyAudioLive) {
+          stopMyAudio();
         }
       };
 
     } catch (err) {
-      isStarting = false;
-      setState("READY");
-      showError(`Start failed: ${err.message}`);
+      isStartingMyAudio = false;
+      btnMyAudio.className = "cp-audio-btn";
+      badgeMyAudio.textContent = "OFF";
+      updateOverallState();
+      showError(`My Audio start failed: ${err.message}`);
     }
   }
 
-  async function initAudioStream() {
+  async function initMicAudioStream() {
     try {
       micStream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -1011,11 +1102,9 @@
       }
 
       const sourceNode = audioContext.createMediaStreamSource(micStream);
-
-      // Downsample / convert Float32 to 16-bit PCM for Deepgram
       const scriptNode = audioContext.createScriptProcessor(4096, 1, 1);
       scriptNode.onaudioprocess = (e) => {
-        if (!isCopilotLive || !socket || socket.readyState !== WebSocket.OPEN) return;
+        if (!isMyAudioLive || !socket || socket.readyState !== WebSocket.OPEN) return;
         const inputData = e.inputBuffer.getChannelData(0);
         const pcm16 = convertFloat32ToInt16(inputData);
         socket.send(pcm16.buffer);
@@ -1027,7 +1116,7 @@
       workletNode = { sourceNode, scriptNode };
     } catch (err) {
       showError(`Microphone access error: ${err.message}`);
-      stopCopilot();
+      stopMyAudio();
     }
   }
 
@@ -1041,14 +1130,11 @@
     return int16Array;
   }
 
-  function stopCopilot() {
-    isCopilotLive = false;
-    isStarting = false;
-    setState("ENDED");
-    mainBtn.classList.remove("active");
-    mainBtn.innerHTML = "<span>⚡ Start Copilot</span>";
-
-    teardownMeetMuteObserver();
+  function stopMyAudio() {
+    isMyAudioLive = false;
+    isStartingMyAudio = false;
+    btnMyAudio.className = "cp-audio-btn";
+    badgeMyAudio.textContent = "OFF";
 
     if (workletNode) {
       try {
@@ -1073,17 +1159,119 @@
       socket = null;
     }
 
-    // Auto-expand Call Summary on call completion
-    fetchPostMeetingSummary();
-    $("cp-acc-body-summary").classList.add("open");
-    $("cp-acc-arrow-summary").textContent = "▾";
+    if (!isClientAudioLive) {
+      teardownMeetMuteObserver();
+      fetchPostMeetingSummary();
+    }
+    updateOverallState();
   }
 
-  mainBtn.addEventListener("click", () => {
-    if (isCopilotLive) {
-      stopCopilot();
+  btnMyAudio.addEventListener("click", () => {
+    if (isMyAudioLive) {
+      stopMyAudio();
     } else {
-      startCopilot();
+      startMyAudio();
+    }
+  });
+
+  // ---------------- 2. Client Audio (Google Meet Tab Capture) ----------------
+
+  async function startClientAudio() {
+    btnClientAudio.className = "cp-audio-btn connecting";
+    badgeClientAudio.textContent = "CONNECTING…";
+
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "START_MEETING_AUDIO"
+      });
+
+      if (response && response.ok) {
+        btnClientAudio.className = "cp-audio-btn client-live";
+        badgeClientAudio.textContent = "LIVE";
+        isClientAudioLive = true;
+        updateOverallState();
+        return;
+      }
+
+      if (response && response.viaPopup) {
+        showError("Connecting client audio via bridge…");
+        return;
+      }
+
+      const errMsg = (response && response.error) || "";
+      if (errMsg.includes("Alt+Shift+M") || errMsg.includes("toolbar icon")) {
+        showError("To allow Client Tab Audio: Press Alt+Shift+M or click extension icon once.");
+      } else {
+        showError(errMsg || "Could not activate Client Audio.");
+      }
+      btnClientAudio.className = "cp-audio-btn";
+      badgeClientAudio.textContent = "OFF";
+      isClientAudioLive = false;
+      updateOverallState();
+    } catch (e) {
+      console.warn("[startClientAudio error]", e);
+      btnClientAudio.className = "cp-audio-btn";
+      badgeClientAudio.textContent = "OFF";
+      isClientAudioLive = false;
+      updateOverallState();
+    }
+  }
+
+  function stopClientAudio() {
+    chrome.runtime.sendMessage({ type: "STOP_MEETING_AUDIO" }).catch(() => {});
+    btnClientAudio.className = "cp-audio-btn";
+    badgeClientAudio.textContent = "OFF";
+    isClientAudioLive = false;
+    updateOverallState();
+    if (!isMyAudioLive) {
+      fetchPostMeetingSummary();
+    }
+  }
+
+  btnClientAudio.addEventListener("click", () => {
+    if (isClientAudioLive) {
+      stopClientAudio();
+    } else {
+      startClientAudio();
+    }
+  });
+
+  // ---------------- Chrome Extension Message Listener ----------------
+
+  chrome.runtime.onMessage.addListener((message) => {
+    if (!message) return;
+    switch (message.type) {
+      case "MEETING_AUDIO_READY":
+        isClientAudioLive = true;
+        btnClientAudio.className = "cp-audio-btn client-live";
+        badgeClientAudio.textContent = "LIVE";
+        updateOverallState();
+        showError("");
+        break;
+
+      case "MEETING_AUDIO_STOPPED":
+        isClientAudioLive = false;
+        btnClientAudio.className = "cp-audio-btn";
+        badgeClientAudio.textContent = "OFF";
+        updateOverallState();
+        break;
+
+      case "MEETING_AUDIO_ERROR":
+        isClientAudioLive = false;
+        btnClientAudio.className = "cp-audio-btn";
+        badgeClientAudio.textContent = "OFF";
+        updateOverallState();
+        showError(message.error || "Client audio failed.");
+        break;
+
+      case "CLIENT_TRANSCRIPT":
+        if (message.isFinal) {
+          setInterim("CLIENT", "");
+          addFinal("CLIENT", message.text);
+        } else {
+          setInterim("CLIENT", message.text);
+        }
+        break;
     }
   });
 
@@ -1208,6 +1396,10 @@
       });
       window.CopilotAnalytics.flushEvents();
     }
+
+    // Auto open Call Summary dropdown
+    $("cp-acc-body-summary").classList.add("open");
+    $("cp-acc-arrow-summary").textContent = "▾";
   }
 
   function generateLocalSummary() {
@@ -1263,9 +1455,10 @@ Key Takeaways & Action Items:
   }
 
   window.addEventListener("beforeunload", () => {
-    stopCopilot();
+    if (isMyAudioLive) stopMyAudio();
+    if (isClientAudioLive) stopClientAudio();
   });
 
   refreshSalesforceStatus();
-  setState("READY");
+  updateOverallState();
 })();

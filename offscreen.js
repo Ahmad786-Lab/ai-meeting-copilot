@@ -1,142 +1,147 @@
-/* offscreen.js — invisible document that captures the meeting tab audio */
+/* offscreen.js — Captures Google Meet tab audio and streams to backend STT */
 
 let mediaStream = null;
-let recorder = null;
+let scriptNode = null;
+let sourceNode = null;
 let socket = null;
 let audioContext = null;
-let keepAliveTimer = null;
 let isCapturing = false;
 
 function report(type, payload) {
   chrome.runtime.sendMessage(Object.assign({ type }, payload || {}));
 }
 
-function startKeepAlive() {
-  stopKeepAlive();
-  keepAliveTimer = setInterval(() => {
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "KeepAlive" }));
-    }
-  }, 8000);
-}
-
-function stopKeepAlive() {
-  if (keepAliveTimer) {
-    clearInterval(keepAliveTimer);
-    keepAliveTimer = null;
+function convertFloat32ToInt16(float32Array) {
+  const l = float32Array.length;
+  const int16Array = new Int16Array(l);
+  for (let i = 0; i < l; i++) {
+    let s = Math.max(-1, Math.min(1, float32Array[i]));
+    int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
   }
+  return int16Array;
 }
 
-function openDeepgram(apiKey) {
+function openBackendSocket() {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(aiCopilotDeepgramUrl(), ["token", apiKey]);
+    const wsUrl = "ws://localhost:3000/transcribe?role=client";
+    const ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
-      startKeepAlive();
+      console.log("[offscreen] connected to backend transcribe for CLIENT audio");
       resolve(ws);
     };
 
-    ws.onerror = () => {
-      reject(new Error("Deepgram connection failed (meeting audio)."));
+    ws.onerror = (err) => {
+      console.error("[offscreen] WebSocket connection failed:", err);
+      reject(new Error("Backend transcribe connection failed (client audio)."));
     };
 
     ws.onclose = () => {
-      stopKeepAlive();
+      console.warn("[offscreen] WebSocket closed");
       socket = null;
-      // Auto-reconnect if we are still supposed to be capturing tab audio
       if (isCapturing && mediaStream && mediaStream.active) {
-        console.log("[offscreen] Deepgram socket closed, reconnecting...");
+        console.log("[offscreen] auto-reconnecting client audio socket in 1.5s...");
         setTimeout(() => {
           if (isCapturing) {
-            openDeepgram(apiKey)
-              .then((newWs) => {
-                socket = newWs;
-              })
-              .catch(() => {});
+            openBackendSocket().then((newWs) => { socket = newWs; }).catch(() => {});
           }
-        }, 1000);
+        }, 1500);
       }
     };
 
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        if (data.type !== "Results") return;
-        const alt = data.channel && data.channel.alternatives[0];
-        const text = alt && alt.transcript && alt.transcript.trim();
-        if (!text) return;
-        report("CLIENT_TRANSCRIPT", { text, isFinal: !!data.is_final });
+        if (data.type === "Results") {
+          const text = (data.text || "").trim();
+          if (!text) return;
+          report("CLIENT_TRANSCRIPT", {
+            text,
+            isFinal: Boolean(data.is_final)
+          });
+        }
       } catch (e) {
-        /* metadata frame */
+        console.warn("[offscreen] error parsing transcript:", e);
       }
     };
   });
 }
 
 async function startCapture(streamId) {
-  const apiKey = AI_COPILOT_CONFIG.DEEPGRAM_API_KEY;
-  if (!apiKey || apiKey === "PASTE_YOUR_DEEPGRAM_KEY_HERE") {
-    throw new Error(
-      "Add your Deepgram key to config.js, then reload the extension."
-    );
-  }
   await stopCapture();
   isCapturing = true;
 
-  mediaStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      mandatory: {
-        chromeMediaSource: "tab",
-        chromeMediaSourceId: streamId,
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        mandatory: {
+          chromeMediaSource: "tab",
+          chromeMediaSourceId: streamId,
+        },
       },
-    },
-    video: false,
-  });
+      video: false,
+    });
 
-  // Capturing a tab mutes it for the user — route audio back to speakers.
-  audioContext = new AudioContext();
-  if (audioContext.state === "suspended") {
-    try { await audioContext.resume(); } catch (e) {}
-  }
-  audioContext
-    .createMediaStreamSource(mediaStream)
-    .connect(audioContext.destination);
-
-  socket = await openDeepgram(apiKey);
-
-  const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-    ? "audio/webm;codecs=opus"
-    : (MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "");
-
-  recorder = mimeType
-    ? new MediaRecorder(mediaStream, { mimeType })
-    : new MediaRecorder(mediaStream);
-
-  recorder.ondataavailable = (event) => {
-    if (event.data.size > 0 && socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(event.data);
+    // 1. AudioContext setup: routes audio back to speakers so user can hear the meeting
+    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    if (audioContext.state === "suspended") {
+      try { await audioContext.resume(); } catch (e) {}
     }
-  };
 
-  recorder.start(250);
-  report("OFFSCREEN_CAPTURE_READY");
+    sourceNode = audioContext.createMediaStreamSource(mediaStream);
+    // Crucial: Route tab audio back to user's headphones/speakers!
+    sourceNode.connect(audioContext.destination);
+
+    // 2. Open backend WebSocket with role=client
+    socket = await openBackendSocket();
+
+    // 3. Audio processor to stream 16-bit linear PCM to backend
+    scriptNode = audioContext.createScriptProcessor(4096, 1, 1);
+    scriptNode.onaudioprocess = (e) => {
+      if (!isCapturing || !socket || socket.readyState !== WebSocket.OPEN) return;
+      const inputData = e.inputBuffer.getChannelData(0);
+      const pcm16 = convertFloat32ToInt16(inputData);
+      socket.send(pcm16.buffer);
+    };
+
+    sourceNode.connect(scriptNode);
+    scriptNode.connect(audioContext.destination);
+
+    report("OFFSCREEN_CAPTURE_READY");
+  } catch (err) {
+    console.error("[offscreen] startCapture failed:", err);
+    report("OFFSCREEN_ERROR", { error: err.message });
+    await stopCapture();
+  }
 }
 
 async function stopCapture() {
   isCapturing = false;
-  stopKeepAlive();
 
-  if (recorder && recorder.state !== "inactive") recorder.stop();
-  recorder = null;
-
-  if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({ type: "CloseStream" }));
-    socket.close();
+  if (scriptNode) {
+    try { scriptNode.disconnect(); } catch (e) {}
+    scriptNode = null;
   }
-  socket = null;
 
-  if (mediaStream) mediaStream.getTracks().forEach((t) => t.stop());
-  mediaStream = null;
+  if (sourceNode) {
+    try { sourceNode.disconnect(); } catch (e) {}
+    sourceNode = null;
+  }
+
+  if (socket) {
+    try {
+      socket.send(JSON.stringify({ type: "CloseStream" }));
+      socket.close();
+    } catch (e) {}
+    socket = null;
+  }
+
+  if (mediaStream) {
+    try {
+      mediaStream.getTracks().forEach((t) => t.stop());
+    } catch (e) {}
+    mediaStream = null;
+  }
 
   if (audioContext) {
     try {

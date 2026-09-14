@@ -2,9 +2,11 @@
  * server.js — Meeting Intelligence, Diarization STT, Rules Engine 2.0 & Salesforce Relay
  *
  * Architecture:
- *  - WebSocket /transcribe: Direct backend bridge to Deepgram STT (nova-2 diarization)
- *  - Rate Limiting: Max 2 concurrent transcription streams per IP
- *  - Audit Logging: Logs every transcription session (timestamp, IP, duration)
+ *  - WebSocket /transcribe: Direct backend bridge to Deepgram STT with dual-channel role routing:
+ *      * ?role=rep -> Guaranteed YOU (speaker 0)
+ *      * ?role=client -> Guaranteed CLIENT (speaker 1)
+ *  - Rate Limiting: Max 4 concurrent transcription streams per IP (supporting dual rep + client audio)
+ *  - Audit Logging: Logs every transcription session (timestamp, IP, role, duration)
  *  - Rules Engine 2.0 API:
  *      * GET /api/playbooks: Retrieve active objection playbooks
  *      * POST /api/playbooks: Create or update objection rules
@@ -29,9 +31,9 @@ const PORT = process.env.PORT || 3000;
 const HOST = "0.0.0.0";
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || "1951c128682faca7eae8f43605be44a5ca809e54";
 
-// Rate limiting map: ip -> active connection count (max 2)
+// Rate limiting map: ip -> active connection count (max 4 to support rep + client streams)
 const activeStreamsByIp = new Map();
-const MAX_CONCURRENT_STREAMS = 2;
+const MAX_CONCURRENT_STREAMS = 4;
 
 // In-memory telemetry events buffer
 const telemetryEvents = [];
@@ -445,7 +447,7 @@ ${keyPoints.map((p) => `• ${p}`).join("\n")}`;
 });
 
 // ---------------------------------------------------------------
-// WebSocket Server — Backend-Managed Deepgram STT with Diarization
+// WebSocket Server — Dual-Channel Deepgram STT Bridge
 // ---------------------------------------------------------------
 
 const wss = new WebSocketServer({ server });
@@ -459,11 +461,13 @@ wss.on("connection", (clientWs, req) => {
     return;
   }
 
-  // 1. Rate Limiting Check
+  const role = url.searchParams.get("role") || "rep"; // "rep" (mic) or "client" (tab audio)
+
+  // 1. Rate Limiting Check (max 4 concurrent to support dual-channel rep + client)
   const currentCount = activeStreamsByIp.get(clientIp) || 0;
   if (currentCount >= MAX_CONCURRENT_STREAMS) {
     console.warn(`[rate-limit] rejected stream for ${clientIp} (exceeds max ${MAX_CONCURRENT_STREAMS})`);
-    clientWs.send(JSON.stringify({ type: "Error", message: "Rate limit exceeded: max 2 active streams." }));
+    clientWs.send(JSON.stringify({ type: "Error", message: "Rate limit exceeded: max concurrent streams reached." }));
     clientWs.close(1008, "Rate limit exceeded");
     return;
   }
@@ -472,7 +476,7 @@ wss.on("connection", (clientWs, req) => {
   // 2. Audit Log Start
   const sessionId = "sess-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7);
   const startTime = Date.now();
-  console.log(`[audit] transcription session started: ${sessionId} IP: ${clientIp} at ${new Date().toISOString()}`);
+  console.log(`[audit] transcription session started: ${sessionId} (role: ${role}) IP: ${clientIp} at ${new Date().toISOString()}`);
 
   if (!DEEPGRAM_API_KEY) {
     clientWs.send(JSON.stringify({ type: "Error", message: "DEEPGRAM_API_KEY not set on server." }));
@@ -488,7 +492,7 @@ wss.on("connection", (clientWs, req) => {
   function connectToDeepgram() {
     if (isClosed) return;
 
-    // Single stream with speaker diarization enabled
+    // Linear 16kHz PCM stream
     const deepgramUrl =
       "wss://api.deepgram.com/v1/listen?model=nova-2&diarize=true&smart_format=true&interim_results=true&encoding=linear16&sample_rate=16000";
 
@@ -496,9 +500,9 @@ wss.on("connection", (clientWs, req) => {
 
     deepgramWs.on("open", () => {
       retryCount = 0;
-      console.log(`[deepgram] connected for session ${sessionId}`);
+      console.log(`[deepgram] connected for session ${sessionId} (${role})`);
       if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(JSON.stringify({ type: "Ready", sessionId }));
+        clientWs.send(JSON.stringify({ type: "Ready", sessionId, role }));
       }
     });
 
@@ -511,9 +515,12 @@ wss.on("connection", (clientWs, req) => {
           const text = (alt.transcript || "").trim();
           if (!text) return;
 
-          // Speaker Diarization: detect speaker (0 = YOU, 1 = CLIENT)
-          let speaker = 0;
-          if (alt.words && alt.words.length > 0) {
+          // Deterministic speaker assignment:
+          // If role is explicitly 'client' -> speaker = 1 (CLIENT)
+          // If role is explicitly 'rep' -> speaker = 0 (YOU)
+          // Fallback to diarization if no role specified
+          let speaker = (role === "client") ? 1 : 0;
+          if (!url.searchParams.has("role") && alt.words && alt.words.length > 0) {
             const spkrs = alt.words.map((w) => w.speaker).filter((s) => s !== undefined);
             if (spkrs.length > 0) {
               speaker = spkrs[0];
@@ -523,6 +530,7 @@ wss.on("connection", (clientWs, req) => {
           clientWs.send(JSON.stringify({
             type: "Results",
             speaker,
+            role,
             text,
             is_final: Boolean(data.is_final)
           }));
@@ -562,7 +570,7 @@ wss.on("connection", (clientWs, req) => {
   clientWs.on("close", () => {
     isClosed = true;
     const durationSec = Math.round((Date.now() - startTime) / 1000);
-    console.log(`[audit] session ended: ${sessionId} duration=${durationSec}s IP=${clientIp}`);
+    console.log(`[audit] session ended: ${sessionId} (${role}) duration=${durationSec}s IP=${clientIp}`);
 
     const updated = Math.max(0, (activeStreamsByIp.get(clientIp) || 1) - 1);
     if (updated === 0) activeStreamsByIp.delete(clientIp);
