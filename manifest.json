@@ -1,19 +1,17 @@
 {
   "manifest_version": 3,
   "name": "AI Meeting Copilot",
-  "version": "0.3.1",
-  "description": "Real-time AI Sales Meeting Copilot with diarization, privacy consent, dynamic playbooks and Salesforce sync.",
+  "version": "0.3.2",
+  "description": "Real-time AI Sales Meeting Copilot with dual audio capture, live transcription, dynamic objection battle cards and call summaries.",
   "permissions": [
     "tabCapture",
     "offscreen",
     "storage",
-    "tabs",
-    "identity"
+    "tabs"
   ],
   "host_permissions": [
     "https://meet.google.com/*",
-    "http://localhost:3000/*",
-    "https://*.salesforce.com/*"
+    "http://localhost:3000/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -38,8 +36,6 @@
         "romanize.js",
         "consent.js",
         "analytics.js",
-        "salesforce-auth.js",
-        "salesforce-service.js",
         "content.js"
       ],
       "run_at": "document_idle"
@@ -49,8 +45,7 @@
     {
       "resources": [
         "offscreen.html",
-        "consent.css",
-        "salesforce-callback.html"
+        "consent.css"
       ],
       "matches": ["https://meet.google.com/*"]
     }

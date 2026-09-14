@@ -9,8 +9,7 @@
  *  - Dynamic Objection Playbooks (Rules Engine 2.0 with custom triggers)
  *  - Persistent, User-Dismissible Cue Cards with Priority Badges (🔴 URGENT, 🟡 CONTEXTUAL, 🟢 FYI)
  *  - Telemetry & Analytics Tracking (cue display/dismissal, call stats)
- *  - Salesforce CRM Integration (OAuth handshake & 1-click Activity Task Sync)
- *  - Streamlined Call Summary & Notes
+ *  - Streamlined Call Summary & Notes with 1-Click Copy
  *  - Fully draggable and collapsible dark-themed HUD
  *  - Google Meet Native Mute Sync (MutationObserver on mic button)
  */
@@ -487,7 +486,7 @@
         line-height: 1.45;
         color: #e8eaed;
         white-space: pre-wrap;
-        max-height: 120px;
+        max-height: 140px;
         overflow-y: auto;
         font-family: inherit;
         margin-bottom: 8px;
@@ -506,71 +505,6 @@
       .cp-copy-notes-btn:hover {
         background: rgba(255, 255, 255, 0.15);
         color: #ffffff;
-      }
-
-      /* Salesforce CRM Card */
-      .cp-sf-box {
-        margin-top: 10px;
-        padding: 8px 10px;
-        background: rgba(0, 161, 224, 0.08);
-        border: 1px solid rgba(0, 161, 224, 0.25);
-        border-radius: 6px;
-      }
-      .cp-sf-row {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-      }
-      .cp-sf-label {
-        font-size: 11px;
-        font-weight: 700;
-        color: #00a1e0;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-      }
-      .cp-sf-badge {
-        font-size: 10px;
-        font-weight: 600;
-        padding: 2px 6px;
-        border-radius: 10px;
-        background: rgba(255, 255, 255, 0.1);
-        color: #9aa0a6;
-      }
-      .cp-sf-badge.connected {
-        background: rgba(46, 204, 113, 0.2);
-        color: #2ecc71;
-      }
-      .cp-sf-actions {
-        display: flex;
-        gap: 6px;
-        margin-top: 6px;
-      }
-      .cp-sf-btn {
-        flex: 1;
-        padding: 6px 10px;
-        font-size: 11px;
-        font-weight: 600;
-        background: #00a1e0;
-        color: #ffffff;
-        border: none;
-        border-radius: 4px;
-        cursor: pointer;
-        transition: background 0.15s;
-        text-align: center;
-      }
-      .cp-sf-btn:hover { background: #0082ba; }
-      .cp-sf-btn-sec {
-        flex: 0 0 auto;
-        background: rgba(255, 255, 255, 0.08);
-        color: #e8eaed;
-        border: 1px solid rgba(255, 255, 255, 0.15);
-      }
-      .cp-sf-btn-sec:hover { background: rgba(255, 255, 255, 0.15); }
-      .cp-sf-status {
-        margin-top: 5px;
-        font-size: 10px;
-        color: #9aa0a6;
-        line-height: 1.3;
       }
     </style>
 
@@ -645,7 +579,7 @@
       <!-- Accordion 2: Streamlined Call Summary Dropdown -->
       <div class="cp-accordion" id="cp-summary-accordion">
         <div class="cp-acc-header" id="cp-acc-head-summary">
-          <span>📊 CALL SUMMARY & CRM</span>
+          <span>📊 CALL SUMMARY</span>
           <span id="cp-acc-arrow-summary">▸</span>
         </div>
         <div class="cp-acc-content" id="cp-acc-body-summary">
@@ -662,19 +596,6 @@
           <div class="cp-notes-box" id="cp-notes-box">Call notes will appear here once conversation starts.</div>
           <div style="overflow:hidden; margin-top:4px;">
             <button class="cp-copy-notes-btn" id="cp-copy-notes-btn">📋 Copy Notes</button>
-          </div>
-
-          <!-- Salesforce CRM Sync Section -->
-          <div class="cp-sf-box">
-            <div class="cp-sf-row">
-              <span class="cp-sf-label">☁️ Salesforce CRM</span>
-              <span class="cp-sf-badge" id="cp-sf-badge">Not Connected</span>
-            </div>
-            <div class="cp-sf-actions">
-              <button class="cp-sf-btn" id="cp-sf-sync-btn">☁️ Sync Call to Salesforce</button>
-              <button class="cp-sf-btn cp-sf-btn-sec" id="cp-sf-login-btn">Connect</button>
-            </div>
-            <div class="cp-sf-status" id="cp-sf-status"></div>
           </div>
         </div>
       </div>
@@ -778,9 +699,6 @@
     const isOpen = body.classList.contains("open");
     body.classList.toggle("open", !isOpen);
     $("cp-acc-arrow-summary").textContent = isOpen ? "▸" : "▾";
-    if (!isOpen) {
-      refreshSalesforceStatus();
-    }
   });
 
   // Menu items
@@ -793,7 +711,6 @@
     $("cp-acc-body-summary").classList.add("open");
     $("cp-acc-arrow-summary").textContent = "▾";
     renderCallSummary();
-    refreshSalesforceStatus();
   });
 
   $("cp-menu-toggle-transcript").addEventListener("click", () => {
@@ -824,93 +741,6 @@
       $("cp-copy-notes-btn").textContent = "Copied! ✓";
       setTimeout(() => { $("cp-copy-notes-btn").textContent = "📋 Copy Notes"; }, 2000);
     });
-  });
-
-  // ---------------- Salesforce CRM Status & Actions ----------------
-
-  async function refreshSalesforceStatus() {
-    try {
-      const isAuth = window.SalesforceAuth ? await window.SalesforceAuth.isAuthenticated() : false;
-      const badge = $("cp-sf-badge");
-      const loginBtn = $("cp-sf-login-btn");
-
-      if (isAuth) {
-        badge.textContent = "Connected";
-        badge.className = "cp-sf-badge connected";
-        loginBtn.textContent = "Disconnect";
-      } else {
-        badge.textContent = "Not Connected";
-        badge.className = "cp-sf-badge";
-        loginBtn.textContent = "Connect";
-      }
-    } catch (e) {
-      console.warn("[SF Status Error]", e.message);
-    }
-  }
-
-  $("cp-sf-login-btn").addEventListener("click", async () => {
-    const statusEl = $("cp-sf-status");
-    if (!window.SalesforceAuth) {
-      statusEl.textContent = "Salesforce module not loaded.";
-      return;
-    }
-
-    const isAuth = await window.SalesforceAuth.isAuthenticated();
-    if (isAuth) {
-      await window.SalesforceAuth.logout();
-      statusEl.textContent = "Disconnected from Salesforce.";
-    } else {
-      statusEl.textContent = "Connecting to Salesforce...";
-      try {
-        const ok = await window.SalesforceAuth.login();
-        if (ok) {
-          statusEl.textContent = "Connected to Salesforce.";
-        }
-      } catch (err) {
-        // Fallback to mock session for testing
-        await window.SalesforceAuth.mockLogin();
-        statusEl.textContent = "Connected (Mock Sandbox Mode).";
-      }
-    }
-    await refreshSalesforceStatus();
-  });
-
-  $("cp-sf-sync-btn").addEventListener("click", async () => {
-    const statusEl = $("cp-sf-status");
-    statusEl.textContent = "Syncing meeting notes to Salesforce...";
-
-    try {
-      const data = lastOutcomeData || generateLocalSummary();
-      const opp = (window.SalesforceAuth && await window.SalesforceAuth.isAuthenticated() && window.SalesforceService)
-        ? await window.SalesforceService.queryOpportunity()
-        : null;
-
-      const oppId = opp ? opp.Id : "006DiscoveryOpp";
-      const talkRatioStr = `Rep ${data.rep_talk_time_pct || 50}% / Client ${data.client_talk_time_pct || 50}%`;
-
-      const res = window.SalesforceService
-        ? await window.SalesforceService.syncCallSummary({
-            oppId,
-            durationMin: data.duration_min,
-            notes: data.notes,
-            talkRatio: talkRatioStr
-          })
-        : { ok: true, taskId: "00TMockTaskLocal" };
-
-      if (res && res.ok) {
-        statusEl.textContent = `✅ Synced to Salesforce! (Task #${res.taskId})`;
-        if (window.CopilotAnalytics) {
-          window.CopilotAnalytics.trackEvent("salesforce_task_created", {
-            taskId: res.taskId,
-            durationMin: data.duration_min
-          });
-        }
-      } else {
-        statusEl.textContent = `⚠️ Sync failed: ${res?.error || "Unknown error"}`;
-      }
-    } catch (err) {
-      statusEl.textContent = `⚠️ Sync error: ${err.message}`;
-    }
   });
 
   function showError(msg) {
@@ -950,7 +780,6 @@
     $("cp-sum-dur").textContent = "0 min";
     $("cp-sum-you").textContent = "50%";
     $("cp-sum-client").textContent = "50%";
-    $("cp-sf-status").textContent = "";
 
     fetch(`${CONFIG.SERVER_URL}/demo-reset`, {
       method: "POST",
@@ -1481,6 +1310,5 @@ Key Takeaways & Action Items:
     if (isClientAudioLive) stopClientAudio();
   });
 
-  refreshSalesforceStatus();
   updateOverallState();
 })();
