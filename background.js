@@ -1,4 +1,4 @@
-/* background.js — service worker */
+/* background.js — Service worker for AI Meeting Copilot */
 
 const OFFSCREEN_PATH = "offscreen.html";
 
@@ -6,15 +6,16 @@ let activeTabId = null;
 let creating = null;
 let capturing = false;
 
-// ---------------- offscreen document ----------------
+// ---------------- Offscreen Document Management ----------------
 
 async function hasOffscreen() {
   if (chrome.runtime.getContexts) {
-    const contexts = await chrome.runtime.getContexts({
-      contextTypes: ["OFFSCREEN_DOCUMENT"],
-      documentUrls: [chrome.runtime.getURL(OFFSCREEN_PATH)],
-    });
-    return contexts.length > 0;
+    try {
+      const contexts = await chrome.runtime.getContexts({
+        contextTypes: ["OFFSCREEN_DOCUMENT"],
+      });
+      return contexts.length > 0;
+    } catch (e) {}
   }
   return false;
 }
@@ -32,6 +33,10 @@ async function ensureOffscreen() {
   });
   try {
     await creating;
+  } catch (err) {
+    if (!err.message || !err.message.includes("Only a single offscreen document")) {
+      throw err;
+    }
   } finally {
     creating = null;
   }
@@ -39,18 +44,20 @@ async function ensureOffscreen() {
 
 async function closeOffscreen() {
   if (await hasOffscreen()) {
-    await chrome.offscreen.closeDocument();
+    try {
+      await chrome.offscreen.closeDocument();
+    } catch (e) {}
   }
 }
 
-// ---------------- content script bridge ----------------
+// ---------------- Content Script Bridge ----------------
 
 function toContent(message) {
   if (activeTabId == null) return;
   chrome.tabs.sendMessage(activeTabId, message).catch(() => {});
 }
 
-// ---------------- start / stop ----------------
+// ---------------- Tab Audio Capture Lifecycle ----------------
 
 async function startTabCapture(tabId) {
   if (capturing && activeTabId === tabId) {
@@ -58,10 +65,11 @@ async function startTabCapture(tabId) {
     return;
   }
 
-  if (capturing) await stopTabCapture();
+  if (capturing) {
+    await stopTabCapture();
+  }
 
   activeTabId = tabId;
-
   await ensureOffscreen();
 
   const streamId = await new Promise((resolve, reject) => {
@@ -91,13 +99,33 @@ async function startTabCapture(tabId) {
 
 async function stopTabCapture() {
   capturing = false;
-  chrome.runtime.sendMessage({ target: "offscreen", type: "STOP_TAB_CAPTURE" });
+  try {
+    chrome.runtime.sendMessage({ target: "offscreen", type: "STOP_TAB_CAPTURE" });
+  } catch (e) {}
   await closeOffscreen();
   toContent({ type: "MEETING_AUDIO_STOPPED" });
   activeTabId = null;
 }
 
-// ---------------- keyboard shortcut (Alt+Shift+M) ----------------
+// ---------------- Toolbar Icon Direct Toggle (No Popup) ----------------
+
+if (chrome.action && chrome.action.onClicked) {
+  chrome.action.onClicked.addListener(async (tab) => {
+    if (!tab || !tab.id) return;
+    if (capturing && activeTabId === tab.id) {
+      await stopTabCapture();
+    } else {
+      try {
+        await startTabCapture(tab.id);
+      } catch (err) {
+        console.error("[copilot] action click capture failed:", err);
+        toContent({ type: "MEETING_AUDIO_ERROR", error: err.message });
+      }
+    }
+  });
+}
+
+// ---------------- Keyboard Shortcut (Alt+Shift+M) ----------------
 
 if (chrome.commands && chrome.commands.onCommand) {
   chrome.commands.onCommand.addListener(async (command) => {
@@ -118,63 +146,33 @@ if (chrome.commands && chrome.commands.onCommand) {
   });
 }
 
-// ---------------- router ----------------
+// ---------------- Message Router ----------------
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message && message.target === "offscreen") return;
+  if (!message || message.target === "offscreen") return;
 
-  switch (message && message.type) {
-    case "ACTIVATE_MEETING_COPILOT":
-      startTabCapture(message.tabId)
-        .then(() => sendResponse({ ok: true }))
-        .catch((err) => {
-          console.error("[copilot] activation failed:", err);
-          if (!capturing) {
-            toContent({ type: "MEETING_AUDIO_ERROR", error: err.message });
-          }
-          sendResponse({
-            ok: capturing,
-            error: capturing ? null : err.message,
-          });
-        });
-      return true;
-
-    case "DEACTIVATE_MEETING_COPILOT":
-      stopTabCapture()
-        .then(() => sendResponse({ ok: true }))
-        .catch((err) => sendResponse({ ok: false, error: err.message }));
-      return true;
-
-    // Content script asking to start meeting audio directly or via popup bridge
+  switch (message.type) {
+    // Content script requesting direct client audio capture
     case "START_MEETING_AUDIO":
+    case "ACTIVATE_MEETING_COPILOT":
     case "REQUEST_MEETING_AUDIO": {
-      const tabId = (sender && sender.tab) ? sender.tab.id : (message.tabId || activeTabId);
+      const tabId = (sender && sender.tab && sender.tab.id) ? sender.tab.id : (message.tabId || activeTabId);
+      if (!tabId) {
+        sendResponse({ ok: false, error: "No active Google Meet tab detected." });
+        return true;
+      }
       startTabCapture(tabId)
         .then(() => sendResponse({ ok: true }))
-        .catch(async (err) => {
-          console.warn("[copilot] direct tab capture failed:", err.message);
-          try {
-            await chrome.storage.local.set({ autoStartTabAudio: true, targetTabId: tabId });
-            if (chrome.action && chrome.action.openPopup) {
-              await chrome.action.openPopup();
-              sendResponse({ ok: true, viaPopup: true });
-            } else {
-              sendResponse({
-                ok: false,
-                error: "Press Alt+Shift+M or click toolbar icon to allow tab audio."
-              });
-            }
-          } catch (popupErr) {
-            sendResponse({
-              ok: false,
-              error: "Press Alt+Shift+M or click toolbar icon to allow tab audio."
-            });
-          }
+        .catch((err) => {
+          console.error("[copilot] startTabCapture failed:", err.message);
+          toContent({ type: "MEETING_AUDIO_ERROR", error: err.message });
+          sendResponse({ ok: false, error: err.message });
         });
       return true;
     }
 
     case "STOP_MEETING_AUDIO":
+    case "DEACTIVATE_MEETING_COPILOT":
       stopTabCapture()
         .then(() => sendResponse({ ok: true }))
         .catch(() => sendResponse({ ok: false }));
@@ -206,5 +204,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  if (tabId === activeTabId) stopTabCapture().catch(() => {});
+  if (tabId === activeTabId) {
+    stopTabCapture().catch(() => {});
+  }
 });

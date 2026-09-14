@@ -3,8 +3,8 @@
  *
  * Enterprise Capabilities:
  *  - Dual Dedicated Audio Controls in HUD:
- *      * 🎤 My Audio: captures Rep microphone via 16kHz PCM
- *      * 🔊 Client Audio: captures Google Meet tab audio via background offscreen bridge
+ *      * 🎤 My Audio: captures Rep microphone via 16kHz PCM (echo-free, Mac-compatible)
+ *      * 🔊 Client Audio: captures Google Meet tab audio directly via offscreen bridge (no popup dialogs)
  *  - Backend-managed Deepgram STT (Zero client-side API keys, dual role routing)
  *  - Dynamic Objection Playbooks (Rules Engine 2.0 with custom triggers)
  *  - Persistent, User-Dismissible Cue Cards with Priority Badges (🔴 URGENT, 🟡 CONTEXTUAL, 🟢 FYI)
@@ -16,8 +16,11 @@
  */
 
 (() => {
-  if (window.__COPILOT_INJECTED__) return;
-  window.__COPILOT_INJECTED__ = true;
+  // Clean up any existing HUD instance on reload/navigation
+  const existingHud = document.getElementById("ai-copilot-hud");
+  if (existingHud) {
+    existingHud.remove();
+  }
 
   const CONFIG = (typeof AI_COPILOT_CONFIG !== "undefined" ? AI_COPILOT_CONFIG : null) || {
     SERVER_URL: "http://localhost:3000",
@@ -1004,20 +1007,28 @@
   async function startMyAudio() {
     if (isMyAudioLive || isStartingMyAudio) return;
 
+    isStartingMyAudio = true;
+    btnMyAudio.className = "cp-audio-btn connecting";
+    badgeMyAudio.textContent = "CONNECTING…";
+    updateOverallState();
+
     if (window.CopilotConsent) {
-      const consented = await window.CopilotConsent.ensureConsent();
-      if (!consented) {
-        showError("Audio consent required to activate copilot.");
-        return;
+      try {
+        const consented = await window.CopilotConsent.ensureConsent();
+        if (!consented) {
+          isStartingMyAudio = false;
+          btnMyAudio.className = "cp-audio-btn";
+          badgeMyAudio.textContent = "OFF";
+          updateOverallState();
+          showError("Audio consent required to activate copilot.");
+          return;
+        }
+      } catch (e) {
+        console.warn("[consent check error, continuing]", e);
       }
     }
 
     try {
-      isStartingMyAudio = true;
-      btnMyAudio.className = "cp-audio-btn connecting";
-      badgeMyAudio.textContent = "CONNECTING…";
-      updateOverallState();
-
       setupMeetMuteObserver();
 
       // Connect to backend STT with role=rep
@@ -1036,11 +1047,6 @@
         }
 
         await initMicAudioStream();
-
-        // Auto-attempt client audio if not already running
-        if (!isClientAudioLive) {
-          startClientAudio();
-        }
       };
 
       socket.onmessage = (event) => {
@@ -1066,12 +1072,23 @@
 
       socket.onerror = (err) => {
         console.error("[rep socket error]", err);
+        isStartingMyAudio = false;
+        if (!isMyAudioLive) {
+          btnMyAudio.className = "cp-audio-btn";
+          badgeMyAudio.textContent = "OFF";
+          updateOverallState();
+        }
         showError("Rep microphone transcribe connection failed.");
       };
 
       socket.onclose = () => {
+        isStartingMyAudio = false;
         if (isMyAudioLive) {
           stopMyAudio();
+        } else {
+          btnMyAudio.className = "cp-audio-btn";
+          badgeMyAudio.textContent = "OFF";
+          updateOverallState();
         }
       };
 
@@ -1090,9 +1107,7 @@
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true,
-          channelCount: 1,
-          sampleRate: 16000
+          autoGainControl: true
         }
       });
 
@@ -1110,10 +1125,14 @@
         socket.send(pcm16.buffer);
       };
 
+      // Mute local loopback so rep doesn't hear their own voice echo back
+      const silenceGain = audioContext.createGain();
+      silenceGain.gain.value = 0;
       sourceNode.connect(scriptNode);
-      scriptNode.connect(audioContext.destination);
+      scriptNode.connect(silenceGain);
+      silenceGain.connect(audioContext.destination);
 
-      workletNode = { sourceNode, scriptNode };
+      workletNode = { sourceNode, scriptNode, silenceGain };
     } catch (err) {
       showError(`Microphone access error: ${err.message}`);
       stopMyAudio();
@@ -1140,6 +1159,7 @@
       try {
         if (workletNode.scriptNode) workletNode.scriptNode.disconnect();
         if (workletNode.sourceNode) workletNode.sourceNode.disconnect();
+        if (workletNode.silenceGain) workletNode.silenceGain.disconnect();
       } catch (e) {}
       workletNode = null;
     }
@@ -1177,8 +1197,11 @@
   // ---------------- 2. Client Audio (Google Meet Tab Capture) ----------------
 
   async function startClientAudio() {
+    if (isClientAudioLive) return;
+
     btnClientAudio.className = "cp-audio-btn connecting";
     badgeClientAudio.textContent = "CONNECTING…";
+    updateOverallState();
 
     try {
       const response = await chrome.runtime.sendMessage({
@@ -1190,26 +1213,23 @@
         badgeClientAudio.textContent = "LIVE";
         isClientAudioLive = true;
         updateOverallState();
-        return;
-      }
-
-      if (response && response.viaPopup) {
-        showError("Connecting client audio via bridge…");
+        showError("");
         return;
       }
 
       const errMsg = (response && response.error) || "";
-      if (errMsg.includes("Alt+Shift+M") || errMsg.includes("toolbar icon")) {
-        showError("To allow Client Tab Audio: Press Alt+Shift+M or click extension icon once.");
-      } else {
-        showError(errMsg || "Could not activate Client Audio.");
-      }
+      showError(errMsg || "Could not activate Client Audio.");
       btnClientAudio.className = "cp-audio-btn";
       badgeClientAudio.textContent = "OFF";
       isClientAudioLive = false;
       updateOverallState();
     } catch (e) {
       console.warn("[startClientAudio error]", e);
+      if (e.message && e.message.includes("Extension context invalidated")) {
+        showError("Extension was reloaded. Please refresh this Google Meet tab.");
+      } else {
+        showError(e.message || "Failed to activate Client Audio.");
+      }
       btnClientAudio.className = "cp-audio-btn";
       badgeClientAudio.textContent = "OFF";
       isClientAudioLive = false;
@@ -1218,7 +1238,9 @@
   }
 
   function stopClientAudio() {
-    chrome.runtime.sendMessage({ type: "STOP_MEETING_AUDIO" }).catch(() => {});
+    try {
+      chrome.runtime.sendMessage({ type: "STOP_MEETING_AUDIO" }).catch(() => {});
+    } catch (e) {}
     btnClientAudio.className = "cp-audio-btn";
     badgeClientAudio.textContent = "OFF";
     isClientAudioLive = false;
@@ -1261,7 +1283,7 @@
         btnClientAudio.className = "cp-audio-btn";
         badgeClientAudio.textContent = "OFF";
         updateOverallState();
-        showError(message.error || "Client audio failed.");
+        showError(message.error || "Client audio capture failed.");
         break;
 
       case "CLIENT_TRANSCRIPT":

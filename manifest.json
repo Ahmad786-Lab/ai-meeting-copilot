@@ -1,10 +1,9 @@
 {
   "manifest_version": 3,
   "name": "AI Meeting Copilot",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Real-time AI Sales Meeting Copilot with diarization, privacy consent, dynamic playbooks and Salesforce sync.",
   "permissions": [
-    "activeTab",
     "tabCapture",
     "offscreen",
     "storage",
@@ -20,7 +19,6 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_popup": "popup.html",
     "default_title": "AI Meeting Copilot"
   },
   "commands": {
