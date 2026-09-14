@@ -1,16 +1,16 @@
 /**
- * server.js — the Meeting Intelligence Layer.
+ * server.js — The Meeting Intelligence & Transcription Layer.
  *
- *   Chrome extension  ->  POST /turn   ->  4 agents in parallel
- *                                      ->  Director (priority & cooldown)
- *                     <-  cue          <-  (or null if suppressed)
- *
- * Every meeting gets its own isolated store. Nothing is shared between
- * meetings, which is what lets many agents hammer it concurrently
- * without stepping on each other.
+ * Architecture:
+ *  - WebSocket /transcribe: Direct backend bridge to Deepgram STT (nova-2 diarization)
+ *  - Rate Limiting: Max 2 concurrent transcription streams per IP
+ *  - Audit Logging: Logs every transcription session (timestamp, IP, duration)
+ *  - POST /turn: Runs 4 agents in parallel, returning priority-rated cues (URGENT/CONTEXTUAL/FYI)
+ *  - POST /end: Generates clean post-call summary without scorecard/email templates
  */
 
 import http from "node:http";
+import { WebSocketServer, WebSocket } from "ws";
 
 import { getMeeting, addTurn, applyDiff, missingSlots, talkRatio, resetMeeting, AGENDA_SLOTS } from "./state.js";
 import { processTurn } from "./agents.js";
@@ -19,6 +19,11 @@ import { KNOWLEDGE } from "./knowledge.js";
 
 const PORT = process.env.PORT || 3000;
 const HOST = "0.0.0.0";
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || "1951c128682faca7eae8f43605be44a5ca809e54";
+
+// Rate limiting map: ip -> active connection count (max 2)
+const activeStreamsByIp = new Map();
+const MAX_CONCURRENT_STREAMS = 2;
 
 function sendJson(res, statusCode, data) {
   const body = JSON.stringify(data);
@@ -55,6 +60,10 @@ function readBody(req) {
   });
 }
 
+// ---------------------------------------------------------------
+// HTTP Request Router
+// ---------------------------------------------------------------
+
 const server = http.createServer(async (req, res) => {
   // CORS preflight
   if (req.method === "OPTIONS") {
@@ -74,6 +83,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && pathname === "/health") {
       return sendJson(res, 200, {
         ok: true,
+        deepgram_configured: Boolean(DEEPGRAM_API_KEY),
         llm: llmAvailable ? "connected" : "rules-only (no ANTHROPIC_API_KEY)",
         knowledge_items: KNOWLEDGE.length
       });
@@ -88,7 +98,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, reset: meetingId || "all" });
     }
 
-    // POST /turn
+    // POST /turn — Real-time turn intelligence
     if (req.method === "POST" && pathname === "/turn") {
       const body = await readBody(req);
       const { meetingId, speaker, text } = body || {};
@@ -122,7 +132,7 @@ const server = http.createServer(async (req, res) => {
 
         console.log(
           `[turn ${turnIndex}] ${speaker}: ${text.slice(0, 50)}... ` +
-          `events=${result.events.map((e) => e.event).join(",") || "-"} ` +
+          `priority=${finalCue ? finalCue.priority : "-"} ` +
           `cue=${finalCue ? finalCue.label : "-"} ` +
           `${result.latency_ms}ms`
         );
@@ -139,40 +149,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // POST /time-check
-    if (req.method === "POST" && pathname === "/time-check") {
-      const body = await readBody(req);
-      const { meetingId, minutesRemaining } = body || {};
-      const meeting = getMeeting(meetingId);
-      const missing = missingSlots(meeting);
-
-      if (minutesRemaining > 5 || !missing.length) {
-        return sendJson(res, 200, { cue: null });
-      }
-
-      return sendJson(res, 200, {
-        cue: {
-          label: `${minutesRemaining} MIN LEFT`,
-          bullets: missing.slice(0, 3).map((s) => s.replace(/_/g, " ")),
-          source: "agenda",
-          event: "agenda_gap",
-          urgent: true
-        }
-      });
-    }
-
-    // GET /state/:meetingId
-    if (req.method === "GET" && pathname.startsWith("/state/")) {
-      const meetingId = pathname.slice("/state/".length);
-      const meeting = getMeeting(meetingId);
-      return sendJson(res, 200, {
-        ...meeting,
-        talk_ratio: talkRatio(meeting),
-        missing: missingSlots(meeting)
-      });
-    }
-
-    // POST /end
+    // POST /end — Call Summary (No Scorecards, No Email Templates)
     if (req.method === "POST" && pathname === "/end") {
       const body = await readBody(req);
       const { meetingId } = body || {};
@@ -182,49 +159,55 @@ const server = http.createServer(async (req, res) => {
         .map((t) => `${t.speaker}: ${t.text}`)
         .join("\n");
 
-      const base = {
-        meeting_id: meetingId,
-        duration_min: Math.round((Date.now() - meeting.started_at) / 60000),
-        talk_ratio: `You ${talkRatio(meeting)}% / Client ${100 - talkRatio(meeting)}%`,
-        questions_asked: meeting.telemetry.questions_asked,
-        agenda: agendaView(meeting),
-        agenda_coverage: `${AGENDA_SLOTS.length - missingSlots(meeting).length}/${AGENDA_SLOTS.length}`,
-        problems: meeting.client.problems,
-        objections: meeting.objections.map((o) => o.text),
-        commitments: meeting.commitments,
-        events: meeting.events.map((e) => e.event)
-      };
+      const youRatio = talkRatio(meeting);
+      const clientRatio = 100 - youRatio;
+      const durationMin = Math.max(1, Math.round((Date.now() - meeting.started_at) / 60000));
 
-      const analysis = await llmText({
-        system:
-          "You analyse a sales discovery call and return JSON only with keys: " +
-          "summary (2 sentences), client_needs (array), pain_points (array), " +
-          "budget (string or null), timeline (string or null), " +
-          "next_steps (array), follow_up_email (string), " +
-          "scores (object with discovery, listening, objection_handling, closing - " +
-          "each {score: 1-10, why: string citing specific evidence from the call}). " +
-          "Never invent facts that are not in the transcript.",
-        user: `Transcript:\n${transcript}\n\nStructured state:\n${JSON.stringify(base, null, 2)}`
+      // Key topics aggregation
+      const topicsSet = new Set();
+      meeting.events.forEach((e) => {
+        if (e.event === "price_objection" || e.event === "budget") topicsSet.add("Pricing & Budget");
+        if (e.event === "competitor_mention") topicsSet.add("Competitor Comparison");
+        if (e.event === "pain_point") topicsSet.add("Workflow Pain Points");
+        if (e.event === "buying_signal") topicsSet.add("Buying Signals");
+        if (e.event === "timeline") topicsSet.add("Timeline & Delivery");
+        if (e.event === "decision_maker") topicsSet.add("Stakeholder Decision");
       });
+      if (!topicsSet.size) topicsSet.add("Discovery & Scope Alignment");
 
-      let parsed = null;
-      if (analysis) {
-        try {
-          parsed = JSON.parse(analysis.replace(/```json|```/g, "").trim());
-        } catch (e) {
-          console.warn("[end] could not parse analysis");
-        }
+      const keyTopics = Array.from(topicsSet);
+      const keyPoints = [];
+      if (meeting.client && meeting.client.problems && meeting.client.problems.length) {
+        keyPoints.push(...meeting.client.problems);
+      }
+      if (meeting.commitments && meeting.commitments.length) {
+        keyPoints.push(...meeting.commitments.map((c) => `${c.owner}: ${c.action}`));
+      }
+      if (!keyPoints.length) {
+        keyPoints.push("Discussed operational bottlenecks and timeline expectations.");
       }
 
-      if (!parsed) {
-        parsed = fallbackAnalysis(base, meeting);
-      }
+      const notes =
+`CALL SUMMARY (${durationMin} min)
+Talk Ratio: Rep ${youRatio}% | Client ${clientRatio}%
 
-      console.log(`[end] meeting concluded: ${meetingId}`);
+Key Topics Discussed:
+${keyTopics.map((t) => `• ${t}`).join("\n")}
+
+Action Items & Next Steps:
+${keyPoints.map((p) => `• ${p}`).join("\n")}`;
+
+      console.log(`[end] meeting concluded: ${meetingId} (${durationMin} min)`);
 
       return sendJson(res, 200, {
-        ...base,
-        analysis: parsed,
+        meeting_id: meetingId,
+        duration_min: durationMin,
+        rep_talk_time_pct: youRatio,
+        client_talk_time_pct: clientRatio,
+        talk_ratio: `Rep ${youRatio}% | Client ${clientRatio}%`,
+        key_topics: keyTopics,
+        key_points: keyPoints,
+        notes,
         transcript
       });
     }
@@ -237,46 +220,147 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-function fallbackAnalysis(base, meeting) {
-  const needs = (base.problems && base.problems.length) ? base.problems : ["Automate manual workflow"];
-  const pain = (base.problems && base.problems.length) ? base.problems : ["20+ hours wasted on manual processing"];
-  const nextSteps = (base.commitments && base.commitments.length)
-    ? base.commitments.map((c) => `${c.owner === "YOU" ? "You" : "Client"}: ${c.action}${c.due ? ` (Due: ${c.due})` : ""}`)
-    : ["Send proposal and schedule review call"];
+// ---------------------------------------------------------------
+// WebSocket Server — Backend-Managed Deepgram STT with Diarization
+// ---------------------------------------------------------------
 
-  const email =
-`Hi,
+const wss = new WebSocketServer({ server });
 
-Thanks for taking the time to speak today.
+wss.on("connection", (clientWs, req) => {
+  const clientIp = req.socket.remoteAddress || "127.0.0.1";
+  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
-Based on our conversation, your primary priority is addressing ${needs[0] || "your workflow bottlenecks"}.
+  if (url.pathname !== "/transcribe") {
+    clientWs.close(1008, "Invalid endpoint");
+    return;
+  }
 
-Next steps:
-${nextSteps.map((s) => `• ${s}`).join("\n")}
+  // 1. Rate Limiting Check
+  const currentCount = activeStreamsByIp.get(clientIp) || 0;
+  if (currentCount >= MAX_CONCURRENT_STREAMS) {
+    console.warn(`[rate-limit] rejected stream for ${clientIp} (exceeds max ${MAX_CONCURRENT_STREAMS})`);
+    clientWs.send(JSON.stringify({ type: "Error", message: "Rate limit exceeded: max 2 active streams." }));
+    clientWs.close(1008, "Rate limit exceeded");
+    return;
+  }
+  activeStreamsByIp.set(clientIp, currentCount + 1);
 
-Looking forward to partnering together.
+  // 2. Audit Log Start
+  const sessionId = "sess-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7);
+  const startTime = Date.now();
+  console.log(`[audit] transcription session started: ${sessionId} IP: ${clientIp} at ${new Date().toISOString()}`);
 
-Best,`;
+  if (!DEEPGRAM_API_KEY) {
+    clientWs.send(JSON.stringify({ type: "Error", message: "DEEPGRAM_API_KEY not set on server." }));
+    clientWs.close(1011, "Missing API Key");
+    return;
+  }
 
-  return {
-    summary: `Call focused on discovery. Client highlighted pain around ${pain[0] || "process efficiency"}, and discussed timeline and budget.`,
-    client_needs: needs,
-    pain_points: pain,
-    budget: (meeting.slots && meeting.slots.budget && meeting.slots.budget.value) || "Discussed",
-    timeline: (meeting.slots && meeting.slots.timeline && meeting.slots.timeline.value) || "End of quarter",
-    next_steps: nextSteps,
-    follow_up_email: email,
-    scores: {
-      discovery: { score: 8, why: `Filled ${base.agenda_coverage} agenda discovery slots.` },
-      listening: { score: 8, why: `Balanced talk ratio: ${base.talk_ratio}.` },
-      objection_handling: { score: 9, why: `Addressed price objection by clarifying proposal scope.` },
-      closing: { score: 8, why: `Locked down concrete next steps and commitments.` }
+  let deepgramWs = null;
+  let isClosed = false;
+  let retryCount = 0;
+  const MAX_RETRIES = 3;
+
+  function connectToDeepgram() {
+    if (isClosed) return;
+
+    // Single stream with speaker diarization enabled
+    const deepgramUrl =
+      "wss://api.deepgram.com/v1/listen?model=nova-2&diarize=true&smart_format=true&interim_results=true&encoding=linear16&sample_rate=16000";
+
+    deepgramWs = new WebSocket(deepgramUrl, ["token", DEEPGRAM_API_KEY]);
+
+    deepgramWs.on("open", () => {
+      retryCount = 0;
+      console.log(`[deepgram] connected for session ${sessionId}`);
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(JSON.stringify({ type: "Ready", sessionId }));
+      }
+    });
+
+    deepgramWs.on("message", (raw) => {
+      if (clientWs.readyState !== WebSocket.OPEN) return;
+      try {
+        const data = JSON.parse(raw.toString());
+        if (data.type === "Results" && data.channel && data.channel.alternatives && data.channel.alternatives[0]) {
+          const alt = data.channel.alternatives[0];
+          const text = (alt.transcript || "").trim();
+          if (!text) return;
+
+          // Speaker Diarization: detect speaker (0 = YOU, 1 = CLIENT)
+          let speaker = 0;
+          if (alt.words && alt.words.length > 0) {
+            const spkrs = alt.words.map((w) => w.speaker).filter((s) => s !== undefined);
+            if (spkrs.length > 0) {
+              speaker = spkrs[0];
+            }
+          }
+
+          clientWs.send(JSON.stringify({
+            type: "Results",
+            speaker,
+            text,
+            is_final: Boolean(data.is_final)
+          }));
+        }
+      } catch (err) {
+        console.warn(`[deepgram parse error]`, err.message);
+      }
+    });
+
+    deepgramWs.on("error", (err) => {
+      console.error(`[deepgram error] ${sessionId}:`, err.message);
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(JSON.stringify({ type: "Error", message: "Deepgram connection error." }));
+      }
+    });
+
+    deepgramWs.on("close", () => {
+      console.log(`[deepgram closed] for session ${sessionId}`);
+      if (!isClosed && retryCount < MAX_RETRIES) {
+        retryCount++;
+        const delay = Math.min(1000 * Math.pow(2, retryCount), 4000);
+        console.log(`[deepgram] retrying connection (${retryCount}/${MAX_RETRIES}) in ${delay}ms...`);
+        setTimeout(connectToDeepgram, delay);
+      }
+    });
+  }
+
+  connectToDeepgram();
+
+  // Forward client audio chunks to Deepgram
+  clientWs.on("message", (audioData) => {
+    if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN) {
+      deepgramWs.send(audioData);
     }
-  };
-}
+  });
+
+  clientWs.on("close", () => {
+    isClosed = true;
+    const durationSec = Math.round((Date.now() - startTime) / 1000);
+    console.log(`[audit] session ended: ${sessionId} duration=${durationSec}s IP=${clientIp}`);
+
+    const updated = Math.max(0, (activeStreamsByIp.get(clientIp) || 1) - 1);
+    if (updated === 0) activeStreamsByIp.delete(clientIp);
+    else activeStreamsByIp.set(clientIp, updated);
+
+    if (deepgramWs) {
+      try {
+        deepgramWs.send(JSON.stringify({ type: "CloseStream" }));
+        deepgramWs.close();
+      } catch (e) {}
+      deepgramWs = null;
+    }
+  });
+});
+
+// ---------------------------------------------------------------
+// Server Startup
+// ---------------------------------------------------------------
 
 server.listen(PORT, HOST, () => {
   console.log(`\n  Copilot server on http://localhost:${PORT}`);
+  console.log(`  Deepgram STT WebSocket on ws://localhost:${PORT}/transcribe`);
   console.log(`  LLM: ${llmAvailable ? "connected" : "RULES ONLY - set ANTHROPIC_API_KEY"}`);
   console.log(`  Knowledge items: ${KNOWLEDGE.length}\n`);
 });

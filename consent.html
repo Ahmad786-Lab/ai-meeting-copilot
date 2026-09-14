@@ -1,0 +1,36 @@
+<div id="ai-copilot-consent-modal" class="cp-consent-overlay" role="dialog" aria-labelledby="cp-consent-title" aria-modal="true">
+  <div class="cp-consent-card">
+    <div class="cp-consent-header">
+      <span class="cp-consent-icon">🔒</span>
+      <h2 id="cp-consent-title" class="cp-consent-title">Audio Privacy Notice</h2>
+    </div>
+
+    <p class="cp-consent-intro">
+      This extension captures your microphone and meeting audio to provide real-time sales coaching.
+    </p>
+
+    <ul class="cp-consent-list">
+      <li>
+        <span class="cp-bullet-icon">🔒</span>
+        <span>Your audio is encrypted and sent to Deepgram for transcription only.</span>
+      </li>
+      <li>
+        <span class="cp-bullet-icon">⏰</span>
+        <span>Transcripts are stored locally on your machine for 30 days, then auto-deleted.</span>
+      </li>
+      <li>
+        <span class="cp-bullet-icon">⚠️</span>
+        <span>All meeting participants should consent to audio capture. Check your local laws.</span>
+      </li>
+      <li>
+        <span class="cp-bullet-icon">📋</span>
+        <span>See our Privacy Policy for data retention and deletion policies.</span>
+      </li>
+    </ul>
+
+    <div class="cp-consent-actions">
+      <button id="cp-consent-decline" class="cp-btn cp-btn-decline" type="button">Decline (Extension Disabled)</button>
+      <button id="cp-consent-agree" class="cp-btn cp-btn-agree" type="button">I Agree & Continue</button>
+    </div>
+  </div>
+</div>

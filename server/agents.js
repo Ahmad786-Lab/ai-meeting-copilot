@@ -3,7 +3,8 @@
  *
  * On every completed turn, four agents run IN PARALLEL against the
  * meeting's own isolated store. The Director reads all four results
- * and provides contextual sales talking points and objection battle cards.
+ * and provides contextual sales talking points and objection battle cards
+ * with explicit priority levels: URGENT, CONTEXTUAL, or FYI.
  */
 
 import { AGENDA_SLOTS, missingSlots } from "./state.js";
@@ -18,54 +19,63 @@ const PATTERNS = [
   {
     event: "price_objection",
     label: "PRICE OBJECTION BATTLE CARD",
+    priority: "URGENT",
     re: /\b(expensive|too much|pricey|costs? too|out of (our )?budget|cheaper|quoted us|lower price|can'?t afford|high price|five thousand|eight thousand)\b/i,
     importance: 0.95
   },
   {
     event: "competitor_mention",
     label: "COMPETITOR COMPARISON",
+    priority: "URGENT",
     re: /\b(another agency|another vendor|competitor|we'?re also (talking|looking)|other quote|someone else quoted|alternative|other firm)\b/i,
+    importance: 0.85
+  },
+  {
+    event: "buying_signal",
+    label: "BUYING SIGNAL: CLOSE FOR NEXT STEPS",
+    priority: "URGENT",
+    re: /\b(how (soon|quickly) can|when could we start|what'?s the next step|send (us|me) (a|the) proposal|sign|get started|onboard|move forward|sounds great|interested)\b/i,
+    importance: 0.9
+  },
+  {
+    event: "decision_maker",
+    label: "TALKING POINT: STAKEHOLDER MAPPING",
+    priority: "URGENT",
+    re: /\b(my (boss|partner|team)|need to (check|ask|run it by)|the board|our cto|ceo|approve|sign ?off|stakeholder|manager)\b/i,
     importance: 0.85
   },
   {
     event: "pain_point",
     label: "TALKING POINT: QUANTIFY THE PAIN",
+    priority: "CONTEXTUAL",
     re: /\b(manually|manual|hours (a|every|per) week|struggle|problem is|pain|frustrat|takes us|waste|inefficien|bottleneck|time consuming|headache)\b/i,
     importance: 0.8
   },
   {
-    event: "buying_signal",
-    label: "BUYING SIGNAL: CLOSE FOR NEXT STEPS",
-    re: /\b(how (soon|quickly) can|when could we start|what'?s the next step|send (us|me) (a|the) proposal|sign|get started|onboard|move forward|sounds great|interested)\b/i,
-    importance: 0.9
-  },
-  {
     event: "budget",
     label: "TALKING POINT: VALUE ANCHORING",
+    priority: "CONTEXTUAL",
     re: /\b(budget|\$\s?\d|\d+k\b|spend|allocated|price range|investment|cost limit)\b/i,
     importance: 0.75
   },
   {
     event: "timeline",
     label: "TALKING POINT: TIMELINE QUALIFICATION",
+    priority: "CONTEXTUAL",
     re: /\b(by (next|the end)|deadline|timeline|q[1-4]\b|next (month|quarter|week)|asap|end of (the )?(month|year)|launch date)\b/i,
     importance: 0.7
   },
   {
-    event: "decision_maker",
-    label: "TALKING POINT: STAKEHOLDER MAPPING",
-    re: /\b(my (boss|partner|team)|need to (check|ask|run it by)|the board|our cto|ceo|approve|sign ?off|stakeholder|manager)\b/i,
-    importance: 0.8
-  },
-  {
     event: "technical_question",
     label: "TECHNICAL & CAPABILITIES PROMPT",
+    priority: "CONTEXTUAL",
     re: /\b(have you (worked|done)|do you (have|support|integrate)|can you|what about|experience with|case stud|how does your|tech stack|architecture)\b/i,
     importance: 0.8
   },
   {
     event: "scope_risk",
     label: "SCOPE MANAGEMENT PROMPT",
+    priority: "CONTEXTUAL",
     re: /\b(also need|while you'?re at it|one more thing|could you also|add(ing)? on|as well as|feature creep)\b/i,
     importance: 0.7
   }
@@ -90,6 +100,7 @@ async function eventAgent(meeting, speaker, text) {
     events: hits.map((h) => ({
       event: h.event,
       label: h.label,
+      priority: h.priority,
       importance: h.importance
     }))
   };
@@ -100,32 +111,42 @@ async function eventAgent(meeting, speaker, text) {
 // ---------------------------------------------------------------
 
 async function agendaAgent(meeting, speaker, text) {
-  const open = missingSlots(meeting);
-  if (!open.length) return { diff: null };
-
-  const looksRelevant = PATTERNS.some(
-    (p) => AGENDA_SLOTS.includes(p.event) && p.re.test(text)
-  ) || /\b(problem|goal|want|need|hoping|trying to|budget|timeline|deadline|hours|manual)\b/i.test(text);
-
-  if (!looksRelevant) return { diff: null };
+  const missing = missingSlots(meeting);
+  if (!missing.length) return { diff: {} };
 
   const diff = {};
-  const lower = text.toLowerCase();
 
-  if (open.includes("problem") && (lower.includes("problem") || lower.includes("struggle") || lower.includes("manual") || lower.includes("waste"))) {
-    diff.problem = text.slice(0, 100);
-  }
-  if (open.includes("budget") && (lower.includes("thousand") || lower.includes("$") || lower.includes("budget") || lower.includes("quote"))) {
-    diff.budget = text.slice(0, 80);
-  }
-  if (open.includes("timeline") && (lower.includes("quarter") || lower.includes("month") || lower.includes("week") || lower.includes("soon") || lower.includes("asap"))) {
-    diff.timeline = text.slice(0, 80);
-  }
-  if (open.includes("decision_maker") && (lower.includes("boss") || lower.includes("board") || lower.includes("team") || lower.includes("approve") || lower.includes("cto"))) {
-    diff.decision_maker = text.slice(0, 80);
+  if (missing.includes("problem")) {
+    const m = text.match(/\b(problem is|struggle with|issue is|bottleneck|waste \w+ hours?|manual \w+)\s+(.{5,80})/i);
+    if (m) diff.problem = m[0].trim();
   }
 
-  return { diff: Object.keys(diff).length ? diff : null };
+  if (missing.includes("impact")) {
+    const m = text.match(/\b(costs? us|losing|waste|spend|takes?)\s+(\$?\d[\d,\.]*\s*(?:hours?|k|dollars?|per week|a month)?)/i);
+    if (m) diff.impact = m[0].trim();
+  }
+
+  if (missing.includes("timeline")) {
+    const m = text.match(/\b(?:by|before|in|target|deadline is)\s+([A-Z][a-z]+|\d{1,2}[\/\-]\d{1,2}|end of (?:month|quarter|year)|asap|next (?:week|month))/i);
+    if (m) diff.timeline = m[0].trim();
+  }
+
+  if (missing.includes("budget")) {
+    const m = text.match(/(?:\$|usd\s*)\s*(\d[\d,\.]*\s*k?)|(\b\d+\s*k\b\s*budget)/i);
+    if (m) diff.budget = m[0].trim();
+  }
+
+  if (missing.includes("decision_maker")) {
+    const m = text.match(/\b(my (?:boss|partner|board|cto|ceo)|we have to (?:decide|approve)|i (?:am the|make the) decision)/i);
+    if (m) diff.decision_maker = m[0].trim();
+  }
+
+  if (missing.includes("next_step")) {
+    const m = text.match(/\b(?:send (?:me|us) (?:a |the )?proposal|meeting on [A-Z][a-z]+|call (?:next week|tomorrow)|review (?:together|with team))/i);
+    if (m) diff.next_step = m[0].trim();
+  }
+
+  return { diff };
 }
 
 // ---------------------------------------------------------------
@@ -135,18 +156,21 @@ async function agendaAgent(meeting, speaker, text) {
 async function commitmentAgent(meeting, speaker, text) {
   if (!COMMITMENT_RE.test(text)) return { commitments: [] };
 
-  const match = text.match(/by\s+(monday|tuesday|wednesday|thursday|friday|tomorrow|next week)/i);
-  const due = match ? match[1] : null;
+  const sentences = text.split(/[.!?]+/).map((s) => s.trim()).filter(Boolean);
+  const hits = sentences.filter((s) => COMMITMENT_RE.test(s));
 
-  return {
-    commitments: [
-      {
-        owner: speaker,
-        action: text.slice(0, 90),
-        due
-      }
-    ]
-  };
+  if (!hits.length) return { commitments: [] };
+
+  const commitments = hits.map((h) => {
+    const dueMatch = h.match(/\bby\s+([A-Za-z]+|\d{1,2}[\/\-]\d{1,2}|tomorrow|next week|end of \w+)/i);
+    return {
+      owner: speaker,
+      action: h.slice(0, 140),
+      due: dueMatch ? dueMatch[1] : null
+    };
+  });
+
+  return { commitments };
 }
 
 // ---------------------------------------------------------------
@@ -163,7 +187,7 @@ async function knowledgeAgent(meeting, speaker, text) {
 // ---------------------------------------------------------------
 
 const COOLDOWN_MS = 2500; // 2.5s pacing
-const MAX_CUES = 25;
+const MAX_CUES = 35;
 
 async function director(meeting, speaker, text, results) {
   const { events, knowledge } = results;
@@ -180,16 +204,17 @@ async function director(meeting, speaker, text, results) {
       bullets: knowledge.bullets,
       source: "knowledge",
       event: "knowledge_retrieval",
-      urgent: true
+      priority: "CONTEXTUAL",
+      urgent: false
     };
   }
 
   // 2. High-priority conversation events (objections, buying signals, pain points)
   if (events && events.length > 0) {
     const top = events.sort((a, b) => b.importance - a.importance)[0];
-    const urgent = top.importance >= 0.85;
+    const isUrgent = top.priority === "URGENT" || top.importance >= 0.85;
 
-    if (!urgent && now - meeting.last_cue_at < COOLDOWN_MS) {
+    if (!isUrgent && now - meeting.last_cue_at < COOLDOWN_MS) {
       return null;
     }
 
@@ -203,7 +228,8 @@ async function director(meeting, speaker, text, results) {
       bullets: bullets.slice(0, 2),
       source: "event_detector",
       event: top.event,
-      urgent
+      priority: top.priority || (isUrgent ? "URGENT" : "CONTEXTUAL"),
+      urgent: isUrgent
     };
   }
 
@@ -246,6 +272,7 @@ async function director(meeting, speaker, text, results) {
           ...slotTalkingPoints[nextSlot],
           source: "agenda_copilot",
           event: "proactive_talking_point",
+          priority: "CONTEXTUAL",
           urgent: false
         };
       }
