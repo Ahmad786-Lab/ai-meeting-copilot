@@ -1,0 +1,57 @@
+[
+  {
+    "id": "playbook-roi-pricing",
+    "trigger": "\\b(expensive|too much|pricey|costs? too|out of (our )?budget|cheaper|discount|lower price|can'?t afford|high price)\\b",
+    "name": "PRICE OBJECTION: ROI ANCHOR",
+    "priority": "URGENT",
+    "actions": [
+      "Acknowledge & pivot: 'Understood. Compared to the $25k monthly manual overhead, our $5k tier delivers 5x ROI in Q1.'",
+      "Ask: 'What specific deliverables would make this an obvious commercial decision for your board?'"
+    ],
+    "active": true
+  },
+  {
+    "id": "playbook-competitor-diff",
+    "trigger": "\\b(hubspot|salesloft|outreach|gong|another vendor|competitor|other quote|someone else quoted|alternative)\\b",
+    "name": "COMPETITOR COMPARISON: ENTERPRISE POD",
+    "priority": "URGENT",
+    "actions": [
+      "Ask: 'What specific capability stood out when evaluating their platform?'",
+      "Differentiate: 'Unlike static recording tools, our real-time copilot runs in-browser with zero latency and custom CRM auto-sync.'"
+    ],
+    "active": true
+  },
+  {
+    "id": "playbook-security-compliance",
+    "trigger": "\\b(security|compliance|soc2|gdpr|hipaa|data privacy|where is (the )?data stored|encryption)\\b",
+    "name": "SECURITY & COMPLIANCE ASSURANCE",
+    "priority": "URGENT",
+    "actions": [
+      "State: 'Audio is processed ephemerally in-memory with TLS 1.3 encryption and zero data retention for training.'",
+      "Offer: 'I can send our SOC2 Type II report and Security Whitepaper right after this call.'"
+    ],
+    "active": true
+  },
+  {
+    "id": "playbook-timeline-acceleration",
+    "trigger": "\\b(deadline|timeline|asap|q[1-4]\\b|next month|next quarter|how fast|kick ?off|launch date)\\b",
+    "name": "TIMELINE ACCELERATION",
+    "priority": "CONTEXTUAL",
+    "actions": [
+      "Anchor: 'Our standard enterprise deployment takes under 10 business days with turnkey onboarding.'",
+      "Propose: 'If we finalize the pilot scope this Friday, your team can be live by the 1st of next month.'"
+    ],
+    "active": true
+  },
+  {
+    "id": "playbook-stakeholder-approval",
+    "trigger": "\\b(my (boss|partner|team)|the board|our cto|ceo|need to (check|ask|run it by)|procurement|finance team)\\b",
+    "name": "EXECUTIVE STAKEHOLDER MAPPING",
+    "priority": "URGENT",
+    "actions": [
+      "Offer: 'Would it be helpful if I prepared a 1-page executive summary ROI deck for your CEO?'",
+      "Ask: 'What primary metrics does your finance team evaluate when reviewing new software tools?'"
+    ],
+    "active": true
+  }
+]

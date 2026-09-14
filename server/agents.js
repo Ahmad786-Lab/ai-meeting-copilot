@@ -1,18 +1,89 @@
 /**
- * agents.js — the multi-agent fan-out & Director.
+ * agents.js — The Multi-Agent Fan-Out, Director & Rules Engine 2.0
  *
  * On every completed turn, four agents run IN PARALLEL against the
- * meeting's own isolated store. The Director reads all four results
- * and provides contextual sales talking points and objection battle cards
- * with explicit priority levels: URGENT, CONTEXTUAL, or FYI.
+ * meeting's own isolated store. The Director evaluates:
+ *  1. Dynamic Objection Playbooks (loaded from playbooks.json / database)
+ *  2. Knowledge Retriever (case studies, pricing models)
+ *  3. Event Detector (built-in objection & agenda patterns)
+ *  4. Agenda Copilot (proactive talking points for YOU)
+ *
+ * Emits battle cards with explicit priority levels: URGENT, CONTEXTUAL, or FYI.
  */
+
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { AGENDA_SLOTS, missingSlots } from "./state.js";
 import { llmJson, llmAvailable } from "./llm.js";
 import { retrieveKnowledge } from "./knowledge.js";
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const PLAYBOOKS_FILE = path.join(__dirname, "playbooks.json");
+
 // ---------------------------------------------------------------
-// Layer 1 — Pattern Matching for Live Meeting Events
+// Rules Engine 2.0 — Dynamic Objection Playbooks
+// ---------------------------------------------------------------
+
+let dynamicPlaybooks = [];
+
+export function loadPlaybooks() {
+  try {
+    if (fs.existsSync(PLAYBOOKS_FILE)) {
+      const raw = fs.readFileSync(PLAYBOOKS_FILE, "utf8");
+      const list = JSON.parse(raw);
+      dynamicPlaybooks = list.map((item) => {
+        let compiledRegex = null;
+        try {
+          compiledRegex = new RegExp(item.trigger, "i");
+        } catch (e) {
+          console.warn(`[playbook regex error] for ${item.id}:`, e.message);
+        }
+        return {
+          ...item,
+          compiledRegex
+        };
+      });
+      console.log(`[playbooks] loaded ${dynamicPlaybooks.length} dynamic playbooks.`);
+    }
+  } catch (err) {
+    console.warn("[playbooks] failed to load playbooks.json:", err.message);
+  }
+}
+
+export function getActivePlaybooks() {
+  if (!dynamicPlaybooks.length) {
+    loadPlaybooks();
+  }
+  return dynamicPlaybooks;
+}
+
+export function savePlaybooks(newList) {
+  dynamicPlaybooks = newList.map((item) => {
+    let compiledRegex = null;
+    try {
+      compiledRegex = new RegExp(item.trigger, "i");
+    } catch (e) {
+      console.warn(`[playbook regex error] for ${item.id}:`, e.message);
+    }
+    return {
+      ...item,
+      compiledRegex
+    };
+  });
+
+  const cleanList = newList.map(({ compiledRegex, ...rest }) => rest);
+  fs.writeFileSync(PLAYBOOKS_FILE, JSON.stringify(cleanList, null, 2), "utf8");
+  return dynamicPlaybooks;
+}
+
+// Initial load
+loadPlaybooks();
+
+// ---------------------------------------------------------------
+// Layer 1 — Default Pattern Matching for Live Meeting Events
 // ---------------------------------------------------------------
 
 const PATTERNS = [
@@ -195,7 +266,28 @@ async function director(meeting, speaker, text, results) {
 
   if (meeting.cue_count >= MAX_CUES) return null;
 
-  // 1. Knowledge match (case study, pricing, team structure) always takes priority
+  // 1. Dynamic Objection Playbooks (Rules Engine 2.0)
+  const activePbs = getActivePlaybooks().filter((p) => p.active !== false);
+  for (const pb of activePbs) {
+    if (pb.compiledRegex && pb.compiledRegex.test(text)) {
+      const isUrgent = pb.priority === "URGENT";
+      if (!isUrgent && now - meeting.last_cue_at < COOLDOWN_MS) {
+        continue;
+      }
+      meeting.last_cue_at = now;
+      meeting.cue_count += 1;
+      return {
+        label: pb.name,
+        bullets: (pb.actions || []).slice(0, 2),
+        source: "dynamic_playbook",
+        event: pb.id,
+        priority: pb.priority || "URGENT",
+        urgent: isUrgent
+      };
+    }
+  }
+
+  // 2. Knowledge match (case study, pricing model, team pod)
   if (knowledge) {
     meeting.last_cue_at = now;
     meeting.cue_count += 1;
@@ -209,7 +301,7 @@ async function director(meeting, speaker, text, results) {
     };
   }
 
-  // 2. High-priority conversation events (objections, buying signals, pain points)
+  // 3. Built-in Pattern Events (fallback objections, buying signals)
   if (events && events.length > 0) {
     const top = events.sort((a, b) => b.importance - a.importance)[0];
     const isUrgent = top.priority === "URGENT" || top.importance >= 0.85;
@@ -233,7 +325,7 @@ async function director(meeting, speaker, text, results) {
     };
   }
 
-  // 3. Proactive Talking Points for YOU (driving the agenda forward)
+  // 4. Proactive Talking Points for YOU (driving agenda forward)
   if (speaker === "YOU" && now - meeting.last_cue_at >= COOLDOWN_MS) {
     const missing = missingSlots(meeting);
     if (missing.length > 0) {

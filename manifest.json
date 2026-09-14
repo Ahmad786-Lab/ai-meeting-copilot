@@ -1,12 +1,20 @@
 {
   "manifest_version": 3,
   "name": "AI Meeting Copilot",
-  "version": "0.2.0",
-  "description": "Real-time AI Sales Meeting Copilot with diarization and privacy consent.",
-  "permissions": ["activeTab", "tabCapture", "offscreen", "storage", "tabs"],
+  "version": "0.3.0",
+  "description": "Real-time AI Sales Meeting Copilot with diarization, privacy consent, dynamic playbooks and Salesforce sync.",
+  "permissions": [
+    "activeTab",
+    "tabCapture",
+    "offscreen",
+    "storage",
+    "tabs",
+    "identity"
+  ],
   "host_permissions": [
     "https://meet.google.com/*",
-    "http://localhost:3000/*"
+    "http://localhost:3000/*",
+    "https://*.salesforce.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -27,13 +35,25 @@
   "content_scripts": [
     {
       "matches": ["https://meet.google.com/*"],
-      "js": ["config.js", "romanize.js", "consent.js", "content.js"],
+      "js": [
+        "config.js",
+        "romanize.js",
+        "consent.js",
+        "analytics.js",
+        "salesforce-auth.js",
+        "salesforce-service.js",
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ],
   "web_accessible_resources": [
     {
-      "resources": ["offscreen.html", "consent.css"],
+      "resources": [
+        "offscreen.html",
+        "consent.css",
+        "salesforce-callback.html"
+      ],
       "matches": ["https://meet.google.com/*"]
     }
   ]

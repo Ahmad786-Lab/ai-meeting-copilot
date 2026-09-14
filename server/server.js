@@ -1,19 +1,27 @@
 /**
- * server.js — The Meeting Intelligence & Transcription Layer.
+ * server.js — Meeting Intelligence, Diarization STT, Rules Engine 2.0 & Salesforce Relay
  *
  * Architecture:
  *  - WebSocket /transcribe: Direct backend bridge to Deepgram STT (nova-2 diarization)
  *  - Rate Limiting: Max 2 concurrent transcription streams per IP
  *  - Audit Logging: Logs every transcription session (timestamp, IP, duration)
- *  - POST /turn: Runs 4 agents in parallel, returning priority-rated cues (URGENT/CONTEXTUAL/FYI)
- *  - POST /end: Generates clean post-call summary without scorecard/email templates
+ *  - Rules Engine 2.0 API:
+ *      * GET /api/playbooks: Retrieve active objection playbooks
+ *      * POST /api/playbooks: Create or update objection rules
+ *      * POST /api/playbooks/upload: Ingest playbook CSV (Trigger,Playbook,Priority,Action)
+ *  - Telemetry API:
+ *      * POST /api/events: Ingest client analytics (cues shown/dismissed, call stats)
+ *  - Salesforce CRM Integration:
+ *      * POST /sync-to-salesforce: Relay call notes into Salesforce Tasks
+ *  - POST /turn: Runs agents in parallel, returning priority-rated cues (URGENT/CONTEXTUAL/FYI)
+ *  - POST /end: Generates clean post-call summary
  */
 
 import http from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 
 import { getMeeting, addTurn, applyDiff, missingSlots, talkRatio, resetMeeting, AGENDA_SLOTS } from "./state.js";
-import { processTurn } from "./agents.js";
+import { processTurn, getActivePlaybooks, savePlaybooks, loadPlaybooks } from "./agents.js";
 import { llmText, llmAvailable } from "./llm.js";
 import { KNOWLEDGE } from "./knowledge.js";
 
@@ -25,13 +33,17 @@ const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || "1951c128682faca7eae8f4
 const activeStreamsByIp = new Map();
 const MAX_CONCURRENT_STREAMS = 2;
 
+// In-memory telemetry events buffer
+const telemetryEvents = [];
+const MAX_STORED_EVENTS = 5000;
+
 function sendJson(res, statusCode, data) {
   const body = JSON.stringify(data);
   res.writeHead(statusCode, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type"
+    "Access-Control-Allow-Headers": "Content-Type, Authorization"
   });
   res.end(body);
 }
@@ -53,11 +65,63 @@ function readBody(req) {
       try {
         resolve(JSON.parse(raw));
       } catch (e) {
-        reject(e);
+        // Fallback for raw text/csv
+        resolve({ rawText: raw });
       }
     });
     req.on("error", reject);
   });
+}
+
+function parsePlaybookCsv(csvText) {
+  const lines = csvText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (lines.length < 1) return [];
+
+  const startIndex = lines[0].toLowerCase().includes("trigger") ? 1 : 0;
+  const results = [];
+
+  for (let i = startIndex; i < lines.length; i++) {
+    const line = lines[i];
+    const regex = /(?:^|,)(\"(?:[^\"]+|\"\")*\"|[^,]*)/g;
+    const tokens = [];
+    let m;
+
+    while ((m = regex.exec(line)) !== null) {
+      let val = m[1] || "";
+      if (val.startsWith('"') && val.endsWith('"')) {
+        val = val.slice(1, -1).replace(/""/g, '"');
+      }
+      tokens.push(val.trim());
+      if (regex.lastIndex === line.length) break;
+    }
+
+    if (tokens.length >= 2 && tokens[0]) {
+      const trigger = tokens[0];
+      const name = tokens[1] || "CUSTOM OBJECTION";
+      const priorityRaw = (tokens[2] || "CONTEXTUAL").toUpperCase();
+      const priority = ["URGENT", "CONTEXTUAL", "FYI"].includes(priorityRaw) ? priorityRaw : "CONTEXTUAL";
+      const actions = tokens[3]
+        ? tokens[3].split(/[;|]/).map((a) => a.trim()).filter(Boolean)
+        : ["Address client concern directly"];
+
+      const id =
+        "pb-" +
+        name.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 24) +
+        "-" +
+        Math.random().toString(36).slice(2, 6);
+
+      results.push({
+        id,
+        trigger,
+        name,
+        priority,
+        actions,
+        active: true
+      });
+    }
+  }
+
+  return results;
 }
 
 // ---------------------------------------------------------------
@@ -70,7 +134,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type"
+      "Access-Control-Allow-Headers": "Content-Type, Authorization"
     });
     return res.end();
   }
@@ -85,7 +149,9 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         deepgram_configured: Boolean(DEEPGRAM_API_KEY),
         llm: llmAvailable ? "connected" : "rules-only (no ANTHROPIC_API_KEY)",
-        knowledge_items: KNOWLEDGE.length
+        knowledge_items: KNOWLEDGE.length,
+        playbooks_count: getActivePlaybooks().length,
+        telemetry_events_count: telemetryEvents.length
       });
     }
 
@@ -97,6 +163,163 @@ const server = http.createServer(async (req, res) => {
       console.log(`[demo-reset] meeting reset: ${meetingId || "ALL"}`);
       return sendJson(res, 200, { ok: true, reset: meetingId || "all" });
     }
+
+    // -------------------------------------------------------------
+    // Dynamic Objection Playbook Endpoints (Rules Engine 2.0)
+    // -------------------------------------------------------------
+
+    // GET /api/playbooks — List all dynamic playbooks
+    if (req.method === "GET" && pathname === "/api/playbooks") {
+      const list = getActivePlaybooks().map(({ compiledRegex, ...pb }) => pb);
+      return sendJson(res, 200, { ok: true, playbooks: list });
+    }
+
+    // POST /api/playbooks — Add or update playbooks
+    if (req.method === "POST" && pathname === "/api/playbooks") {
+      const body = await readBody(req);
+      const current = getActivePlaybooks();
+
+      if (Array.isArray(body.playbooks)) {
+        savePlaybooks(body.playbooks);
+        return sendJson(res, 200, { ok: true, message: "Playbooks saved", count: body.playbooks.length });
+      }
+
+      if (body.trigger && body.name) {
+        const id = body.id || "pb-" + Date.now().toString(36);
+        const updated = current.filter((p) => p.id !== id);
+        updated.push({
+          id,
+          trigger: body.trigger,
+          name: body.name,
+          priority: body.priority || "CONTEXTUAL",
+          actions: Array.isArray(body.actions) ? body.actions : [body.actions || "Acknowledge client concern"],
+          active: body.active !== false
+        });
+        savePlaybooks(updated);
+        return sendJson(res, 200, { ok: true, playbook: id });
+      }
+
+      return sendJson(res, 400, { error: "Invalid playbook payload. Expected { playbooks: [...] } or { trigger, name }" });
+    }
+
+    // POST /api/playbooks/upload — Bulk CSV upload
+    if (req.method === "POST" && pathname === "/api/playbooks/upload") {
+      const body = await readBody(req);
+      const csvContent = body.csv || body.rawText;
+
+      if (!csvContent) {
+        return sendJson(res, 400, { error: "No CSV content provided. Expected { csv: '...' } or text/csv body." });
+      }
+
+      const parsed = parsePlaybookCsv(csvContent);
+      if (!parsed.length) {
+        return sendJson(res, 400, { error: "No valid playbook rows parsed. CSV format: Trigger,Playbook,Priority,Action" });
+      }
+
+      const current = getActivePlaybooks();
+      const existingIds = new Set(parsed.map((p) => p.id));
+      const merged = current.filter((p) => !existingIds.has(p.id)).concat(parsed);
+      savePlaybooks(merged);
+
+      console.log(`[playbooks] CSV imported ${parsed.length} rules. Total now: ${merged.length}`);
+      return sendJson(res, 200, {
+        ok: true,
+        imported_count: parsed.length,
+        total_playbooks: merged.length,
+        playbooks: parsed
+      });
+    }
+
+    // -------------------------------------------------------------
+    // Telemetry & Analytics Ingestion
+    // -------------------------------------------------------------
+
+    // POST /api/events — High-throughput telemetry batch ingestion
+    if (req.method === "POST" && pathname === "/api/events") {
+      const body = await readBody(req);
+      const events = Array.isArray(body.events) ? body.events : (body.event ? [body] : []);
+
+      for (const ev of events) {
+        telemetryEvents.push({
+          ...ev,
+          received_at: new Date().toISOString()
+        });
+        if (telemetryEvents.length > MAX_STORED_EVENTS) {
+          telemetryEvents.shift();
+        }
+      }
+
+      if (events.length > 0) {
+        const types = events.map((e) => e.event_type).join(", ");
+        console.log(`[analytics] ingested ${events.length} event(s): [${types}]`);
+      }
+
+      return sendJson(res, 200, { ok: true, received: events.length });
+    }
+
+    // -------------------------------------------------------------
+    // Salesforce CRM Relay Proxy
+    // -------------------------------------------------------------
+
+    // POST /sync-to-salesforce — Secure proxy to Salesforce REST API Task creation
+    if (req.method === "POST" && pathname === "/sync-to-salesforce") {
+      const body = await readBody(req);
+      const { oppId, subject, description, accessToken, instanceUrl } = body || {};
+
+      // Handle Mock / Sandbox mode
+      if (!accessToken || accessToken.startsWith("mock_") || !instanceUrl) {
+        const mockTaskId = "00T" + Math.random().toString(36).substring(2, 12).toUpperCase();
+        console.log(`[salesforce] mock sync completed for Opp: ${oppId || "MockOpp"} (Task: ${mockTaskId})`);
+        return sendJson(res, 200, {
+          ok: true,
+          taskId: mockTaskId,
+          mock: true,
+          message: "Saved in Mock Salesforce Mode"
+        });
+      }
+
+      // Live Salesforce REST API Call
+      try {
+        const cleanInstance = instanceUrl.replace(/\/+$/, "");
+        const taskEndpoint = `${cleanInstance}/services/data/v58.0/sobjects/Task`;
+
+        const sfRes = await fetch(taskEndpoint, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            WhatId: oppId && !oppId.includes("Mock") ? oppId : undefined,
+            Subject: subject || "AI Meeting Copilot Discovery Summary",
+            Description: description || "",
+            Status: "Completed",
+            Priority: "Normal",
+            ActivityDate: new Date().toISOString().split("T")[0]
+          })
+        });
+
+        const sfData = await sfRes.json();
+
+        if (sfRes.ok) {
+          console.log(`[salesforce] live Task created: ${sfData.id}`);
+          return sendJson(res, 200, { ok: true, taskId: sfData.id });
+        } else {
+          console.warn(`[salesforce] API error from Salesforce:`, sfData);
+          return sendJson(res, sfRes.status, {
+            ok: false,
+            error: sfData[0] ? sfData[0].message : JSON.stringify(sfData)
+          });
+        }
+      } catch (err) {
+        console.error(`[salesforce] relay connection failed:`, err);
+        return sendJson(res, 500, { ok: false, error: err.message });
+      }
+    }
+
+    // -------------------------------------------------------------
+    // Core Copilot Turn Intelligence & End
+    // -------------------------------------------------------------
 
     // POST /turn — Real-time turn intelligence
     if (req.method === "POST" && pathname === "/turn") {
@@ -149,7 +372,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // POST /end — Call Summary (No Scorecards, No Email Templates)
+    // POST /end — Call Summary
     if (req.method === "POST" && pathname === "/end") {
       const body = await readBody(req);
       const { meetingId } = body || {};
@@ -172,6 +395,7 @@ const server = http.createServer(async (req, res) => {
         if (e.event === "buying_signal") topicsSet.add("Buying Signals");
         if (e.event === "timeline") topicsSet.add("Timeline & Delivery");
         if (e.event === "decision_maker") topicsSet.add("Stakeholder Decision");
+        if (e.event === "security_compliance") topicsSet.add("Security & Compliance");
       });
       if (!topicsSet.size) topicsSet.add("Discovery & Scope Alignment");
 
@@ -361,6 +585,7 @@ wss.on("connection", (clientWs, req) => {
 server.listen(PORT, HOST, () => {
   console.log(`\n  Copilot server on http://localhost:${PORT}`);
   console.log(`  Deepgram STT WebSocket on ws://localhost:${PORT}/transcribe`);
+  console.log(`  Dynamic Playbooks: ${getActivePlaybooks().length} rules loaded`);
   console.log(`  LLM: ${llmAvailable ? "connected" : "RULES ONLY - set ANTHROPIC_API_KEY"}`);
   console.log(`  Knowledge items: ${KNOWLEDGE.length}\n`);
 });
